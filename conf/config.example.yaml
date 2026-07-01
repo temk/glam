@@ -1,0 +1,28 @@
+# Copy to conf/config.local.yaml and fill in your actual inference host(s).
+# See docs/architecture.md for the full schema and rationale.
+target_lang: ru
+source_lang: en
+
+steps:
+  asr:
+    backend: openai_compatible
+    base_url: http://<inference-host>:8000/v1
+    model: Systran/faster-whisper-large-v3
+    api_key_env: LOCAL_API_KEY
+    # timestamp_granularities: [segment, word]   # default; drop "word" if the backend rejects it
+  translate:
+    backend: openai_compatible
+    base_url: http://<inference-host>:11434/v1
+    model: qwen2.5:7b
+    api_key_env: LOCAL_API_KEY
+    glossary: ./conf/glossary.example.txt
+  tts:
+    backend: openai_compatible
+    base_url: http://<inference-host>:PORT/v1     # TBD once the TTS service is deployed
+    model: xtts-v2
+    voice: default
+    api_key_env: LOCAL_API_KEY
+
+mux:
+  keep_original_audio: true
+  hardsub: false

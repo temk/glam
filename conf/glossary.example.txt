@@ -1,0 +1,12 @@
+# Copy to conf/glossary.local.txt (or point steps.translate.glossary at this file).
+# One term per line. Terms listed here are always left untranslated, verbatim,
+# in the output. See docs/architecture.md for how this combines with the
+# general loanword-preservation instruction in the translation prompt.
+loss
+inference
+distribution
+gradient
+embedding
+batch
+epoch
+overfitting

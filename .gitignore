@@ -1,0 +1,10 @@
+jobs/*
+!jobs/.gitkeep
+
+*.local.*
+
+__pycache__/
+*.pyc
+.venv/
+*.egg-info/
+.idea/
