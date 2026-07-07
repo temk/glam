@@ -1,153 +1,184 @@
 # GLAM
 
-Glossary-Locked Audio Muxer: a CLI pipeline for translating local video files into Russian or another target language, with technical terms protected by a glossary.
+**Glossary-Locked Audio Muxer** — a command-line tool that translates a local video
+into another language, producing translated subtitles and a dubbed audio track, then
+muxing them back into the video.
 
-GLAM is designed for technical and educational videos where generic machine translation often gets important jargon wrong. The pipeline transcribes the source audio, translates the transcript with an LLM while preserving selected terms, generates subtitles and a dubbed audio track, then muxes everything back into the video.
+GLAM is built for technical and educational content — talks, lectures, tutorials — where
+ordinary machine translation mangles the jargon. You give it a glossary of terms that must
+stay untranslated or be rendered a specific way (`loss`, `embedding`, `Kubernetes`, …),
+and GLAM keeps them locked across the whole translation.
 
-## Pipeline
+## How it works
+
+The pipeline runs locally as a series of small, resumable steps. Each step reads and writes
+plain files in a job folder, so you can inspect, rerun, or fix any stage in isolation.
 
 ```mermaid
-flowchart TD
-    IN([Input video file]) --> INIT[init: register job and extract audio]
-    INIT --> ASR[transcribe: ASR]
-    ASR --> TR[translate: LLM + glossary]
-    TR --> SUB[subtitles: SRT]
-    TR --> TTS[tts: speech synthesis]
-    SUB --> MUX[mux: ffmpeg]
+flowchart LR
+    IN([video file]) --> INIT[init]
+    INIT --> ASR[transcribe]
+    ASR --> TR[translate]
+    TR --> SUB[subtitles]
+    TR --> TTS[tts]
+    SUB --> MUX[mux]
     TTS --> MUX
-    MUX --> OUT([Output MKV])
+    MUX --> OUT([dubbed .mp4])
 ```
 
-The CLI runs locally and uses `ffmpeg` for media work. ASR, LLM translation, and TTS are called over HTTP through OpenAI-compatible endpoints, so model backends can be local, self-hosted, or commercial without changing pipeline code.
+- **init** — register a job, extract the audio, copy in your glossary
+- **transcribe** — speech-to-text of the source audio
+- **translate** — glossary-locked translation of the transcript with an LLM
+- **subtitles** — render the translation to an `.srt` file
+- **tts** — synthesize a dubbed audio track
+- **mux** — combine source video, dubbed audio, and subtitles into the final `.mp4`
 
-## Goals
-
-- Translate local video files into dubbed audio and translated subtitles.
-- Preserve technical vocabulary such as `loss`, `inference`, `embedding`, `batch`, and similar terms.
-- Keep every pipeline step idempotent and file-based.
-- Cache outputs by backend/model so different model runs can coexist.
-- Allow model providers to be swapped through configuration only.
-
-## Non-goals
-
-- GLAM does not download videos. It expects a local video file as input.
-- GLAM does not require local GPU access on the runner machine. Model inference can run elsewhere.
-- GLAM is not tied to one ASR, LLM, or TTS provider.
-
-## CLI
-
-Planned command shape:
-
-```bash
-glam init <video_file> [--id ID]
-glam transcribe <video_id> [-c config.yaml]
-glam translate <video_id> --lang ru [-c config.yaml]
-glam subtitles <video_id> --lang ru
-glam tts <video_id> --lang ru [-c config.yaml]
-glam mux <video_id> --lang ru [--hardsub]
-glam run <video_file> --lang ru [-c config.yaml]
-```
-
-`glam run` executes the full pipeline and skips cached steps unless forced.
-
-## Job Layout
-
-Each video is stored under a job directory keyed by `video_id`:
-
-```text
-jobs/<video_id>/
-  meta.json
-  source.mp4
-  audio.wav
-  transcript.<asr_model>.json
-  translation.<lang>.<model>.json
-  subtitles.<lang>.<model>.srt
-  tts_segments.<lang>.<tts_model>.<voice>/
-  tts_track.<lang>.<tts_model>.<voice>.wav
-  output.<lang>.mkv
-```
-
-Outputs include the relevant model or backend in the filename. Re-running a step with a different model creates a new file instead of replacing the old one.
-
-## Configuration
-
-Example `config.yaml`:
-
-```yaml
-target_lang: ru
-source_lang: en
-
-steps:
-  asr:
-    backend: openai_compatible
-    base_url: http://<inference-host>:8000/v1
-    model: Systran/faster-whisper-large-v3
-    api_key_env: LOCAL_API_KEY
-
-  translate:
-    backend: openai_compatible
-    base_url: http://<inference-host>:11434/v1
-    model: qwen2.5:7b
-    api_key_env: LOCAL_API_KEY
-    glossary: ./glossary.yaml
-
-  tts:
-    backend: openai_compatible
-    base_url: http://<inference-host>:PORT/v1
-    model: xtts-v2
-    voice: default
-    api_key_env: LOCAL_API_KEY
-
-mux:
-  keep_original_audio: true
-  hardsub: false
-```
-
-Example glossary:
-
-```yaml
-never_translate:
-  - loss
-  - inference
-  - distribution
-  - gradient
-  - embedding
-  - batch
-  - epoch
-  - overfitting
-```
+`ffmpeg` handles the media work locally. Transcription, translation, and speech synthesis
+are called over HTTP, so the models can run on your own machine, a self-hosted server, or a
+commercial API — you only change the config, never the pipeline.
 
 ## Requirements
 
-- Linux shell environment.
-- `ffmpeg` and `ffprobe`.
-- OpenAI-compatible ASR endpoint, for example a Whisper-compatible service.
-- OpenAI-compatible chat completion endpoint for translation.
-- OpenAI-compatible TTS endpoint for dubbing.
-- Python dependencies for subtitle handling, such as `pysubs2`, once the implementation scaffold is added.
+- Linux, Python **3.10+**, and [`uv`](https://docs.astral.sh/uv/)
+- `ffmpeg` and `ffprobe` on your `PATH`
+- Reachable model endpoints for the steps you run:
+  - a transcription (ASR) endpoint,
+  - a chat-completion endpoint for translation,
+  - a text-to-speech endpoint for dubbing.
 
-Before wiring a backend into the config, verify that it exposes the required OpenAI-compatible endpoint and is reachable from the machine running the CLI.
+Endpoints can speak the **OpenAI-compatible** API (`protocol: openai`) or a supported native
+protocol (for TTS, `protocol: chatterbox`).
 
-## Design Principles
+## Install
 
-- **Idempotent steps.** A step skips work when its expected output already exists, unless `--force` is used.
-- **No silent overwrites.** Cached outputs are model-specific and kept side by side.
-- **Provider-neutral model calls.** ASR, translation, and TTS use OpenAI-compatible API shapes.
-- **Glossary-first translation.** The glossary is a core feature, not an optional post-processing detail.
-- **Explicit files between steps.** Each step reads and writes concrete files, making debugging and reruns simple.
+```bash
+git clone <this-repo> glam && cd glam
+uv sync
+```
 
-## Current Status
+This creates a virtual environment and installs GLAM. Run commands with `uv run glam …`
+(the examples below use that form).
 
-This repository currently describes the intended architecture and command interface. The next implementation milestones are:
+## Configure
 
-1. Add the project scaffold, config schema, and CLI entry point.
-2. Implement `init` with `ffprobe` metadata extraction and `ffmpeg` audio extraction.
-3. Wire ASR to an OpenAI-compatible transcription endpoint.
-4. Implement glossary-aware translation with batch alignment.
-5. Generate SRT subtitles with reading-speed-aware segmentation.
-6. Add TTS generation, duration fitting, and track assembly.
-7. Mux original video, original audio, dubbed audio, and subtitles into MKV.
+GLAM reads a YAML config, by default from `~/.glam.yaml` (override with `-c/--config`).
+Copy the example and edit the endpoints:
 
-## Architecture Notes
+```bash
+cp conf/config.example.yaml ~/.glam.yaml
+```
 
-The longer architecture document covers backend choices, job caching, TTS duration synchronization, muxing decisions, and open questions around orchestration.
+A minimal config:
+
+```yaml
+job_dir: ./jobs
+
+# Used by `init` when you omit --source / --target.
+defaults:
+  source: en
+  target: ru
+
+services:
+  - name: transcribe
+    protocol: openai
+    url: http://<inference-host>:8000/v1
+    params:
+      model: Systran/faster-whisper-large-v3
+
+  - name: translate
+    protocol: openai
+    url: http://<inference-host>:11434/v1
+    params:
+      model: qwen2.5:14b
+      api_key: MY_SECRET_KEY   # optional; omit for keyless local servers
+
+  - name: tts
+    protocol: chatterbox
+    url: http://<inference-host>:8004
+```
+
+See `conf/config.example.yaml` for all options, including an OpenAI-compatible TTS
+alternative.
+
+## Quick start
+
+Translate a video end to end (the job id is derived from the filename — here `lecture`):
+
+```bash
+uv run glam init lecture.mp4 --glossary glossary.json   # prints the job id, here "lecture"
+uv run glam transcribe --job-id lecture
+uv run glam translate  --job-id lecture
+uv run glam subtitles  --job-id lecture
+uv run glam tts        --job-id lecture
+uv run glam mux        --job-id lecture
+```
+
+The result lands in the job folder as `lecture.mp4`, with a `result.mp4` symlink pointing
+to it.
+
+Every step is **idempotent**: rerun it and it skips work that is already done. Pass
+`--force` to recompute a step.
+
+## The glossary
+
+The glossary is the whole point of GLAM. Pass it to `init` with `--glossary`. It can be:
+
+- a JSON array of terms to keep verbatim — `["Kubernetes", "pod", "loss"]`
+- a JSON object mapping a term to its required translation — `{"pod": "под", "node": "нода"}`
+- a plain-text file, one term per line (`#` comments and blank lines ignored)
+
+During translation the model is instructed to apply these rules strictly, so protected
+terms never drift.
+
+## Languages and voices
+
+- Set the target with `--target <lang>` on `translate`, `subtitles`, and `tts`
+  (it falls back to the job's target, then to `defaults.target`).
+- Translations into several languages coexist in one job — artifacts are named per language
+  (`translation.ru.json`, `subtitles.de.srt`, `tts.ru.wav`, …).
+- Choose a dubbing voice with `--voice` on `init` (stored with the job) or on `tts`. Omit it
+  to use the server's default voice.
+- `mux` picks up every `tts.*.wav` and `subtitles.*.srt` in the job and adds them all as
+  labeled tracks; use `--exclude <artifact>` to leave one out.
+
+## Job folder
+
+Each job is a self-contained folder under `job_dir`:
+
+```text
+jobs/<job-id>/
+  job.yaml              # job manifest
+  source.mp4            # link to the input video
+  audio.wav             # extracted audio
+  glossary.json         # normalized glossary
+  transcript.json       # transcribe output
+  translation.<lang>.json
+  subtitles.<lang>.srt
+  tts.<lang>[.<voice>].wav
+  <name>.mp4            # final muxed video
+  result.mp4            # symlink to the latest result
+```
+
+Because everything is a file, you can open any intermediate artifact, tweak it, and rerun
+the downstream steps.
+
+## Command reference
+
+```bash
+uv run glam init <video> [--source LANG] [--target LANG] [--glossary PATH] [--voice V] [--job-id ID] [--force]
+uv run glam transcribe --job-id ID [--force]
+uv run glam translate  --job-id ID [--target LANG] [--batch-size N] [--context-size N] [--dump] [--force]
+uv run glam subtitles  --job-id ID [--target LANG] [--force]
+uv run glam tts        --job-id ID [--target LANG] [--voice V] [--force]
+uv run glam mux        --job-id ID [--exclude ARTIFACT]... [--force]
+```
+
+All commands accept `-c/--config PATH`. `--dump` on `translate` writes the raw model
+exchanges into `translate.<lang>.dump/` for debugging.
+
+## Learn more
+
+Architecture, backend design, and per-step specifications live in [`docs/`](docs/):
+
+- [`docs/architecture.md`](docs/architecture.md) — how the pipeline and backends fit together
+- [`docs/steps/`](docs/steps/) — a detailed spec for each step

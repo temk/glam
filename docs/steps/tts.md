@@ -21,7 +21,7 @@ This step executes local pipeline logic, but the speech synthesis model is calle
 ## CLI
 
 ```bash
-uv run glam tts <job-id> [--target LANG] [--voice VOICE] [--config PATH] [--force]
+uv run glam tts --job-id JOB_ID [--target LANG] [--voice VOICE] [--config PATH] [--force]
 ```
 
 The CLI is defined in `src/glam/cli.py`.

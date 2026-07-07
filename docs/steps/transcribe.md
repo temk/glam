@@ -17,7 +17,7 @@ The step runs local pipeline code, but the ASR model is called through a remote 
 ## CLI
 
 ```bash
-uv run glam transcribe <job-id> [--config PATH] [--force]
+uv run glam transcribe --job-id JOB_ID [--config PATH] [--force]
 ```
 
 The CLI is defined in `src/glam/cli.py`.

@@ -19,7 +19,7 @@ This step runs **locally**.
 ## CLI
 
 ```bash
-uv run glam subtitles <job-id> [--target LANG] [--config PATH] [--force]
+uv run glam subtitles --job-id JOB_ID [--target LANG] [--config PATH] [--force]
 ```
 
 `--target` overrides the job's default target language from `job.yaml`; the step reads

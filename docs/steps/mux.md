@@ -19,13 +19,13 @@ This step runs **locally** and does not call a model backend.
 ## CLI
 
 ```bash
-uv run glam mux <job-id> [--exclude ARTIFACT]... [--config PATH] [--force]
+uv run glam mux --job-id JOB_ID [--exclude ARTIFACT]... [--config PATH] [--force]
 ```
 
 `--exclude` may be passed multiple times. Its value is an artifact name inside the job directory, for example:
 
 ```bash
-uv run glam mux example-video --exclude subtitles.en.srt --exclude tts.he.wav
+uv run glam mux --job-id example-video --exclude subtitles.en.srt --exclude tts.he.wav
 ```
 
 Only discovered subtitle/audio artifacts of this step may be excluded: `subtitles*.srt` and `tts*.wav`. A non-existing artifact passed to `--exclude` is an error, so typos are not silently ignored.

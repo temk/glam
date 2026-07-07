@@ -22,7 +22,7 @@ The step runs local pipeline code, but the translation model is called through a
 ## CLI
 
 ```bash
-uv run glam translate <job-id> [--target LANG] [--config PATH] [--batch-size N] [--context-size N] [--dump] [--force]
+uv run glam translate --job-id JOB_ID [--target LANG] [--config PATH] [--batch-size N] [--context-size N] [--dump] [--force]
 ```
 
 - `--target` — target language code, overriding the job's default target from `job.yaml`.

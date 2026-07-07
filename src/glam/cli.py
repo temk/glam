@@ -33,6 +33,8 @@ target_option = click.option(
     "--target", "target", default=None, help="Target language code, overriding the job's target from job.yaml"
 )
 
+job_id_option = click.option("--job-id", "job_id", required=True, help="Id of the job to operate on")
+
 
 @click.group()
 def main():
@@ -91,7 +93,7 @@ def init_cmd(video_file, source_lang, target_lang, glossary_path, voice, job_id,
 
 
 @main.command("transcribe")
-@click.argument("job_id")
+@job_id_option
 @config_option
 @click.option("--force", is_flag=True, help="Recompute even if the transcript already exists")
 @handle_glam_errors
@@ -106,7 +108,7 @@ def transcribe_cmd(job_id, config_path, force):
 
 
 @main.command("translate")
-@click.argument("job_id")
+@job_id_option
 @target_option
 @config_option
 @click.option("--batch-size", type=int, default=None, help="Segments translated per request (default: 100)")
@@ -131,7 +133,7 @@ def translate_cmd(job_id, target, config_path, batch_size, context_size, dump, f
 
 
 @main.command("subtitles")
-@click.argument("job_id")
+@job_id_option
 @target_option
 @config_option
 @click.option("--force", is_flag=True, help="Recompute even if the subtitles already exist")
@@ -147,7 +149,7 @@ def subtitles_cmd(job_id, target, config_path, force):
 
 
 @main.command("tts")
-@click.argument("job_id")
+@job_id_option
 @target_option
 @click.option("--voice", default=None, help="Voice to synthesize with, overriding the job's voice from job.yaml")
 @config_option
@@ -164,7 +166,7 @@ def tts_cmd(job_id, target, voice, config_path, force):
 
 
 @main.command("mux")
-@click.argument("job_id")
+@job_id_option
 @click.option("--exclude", "exclude", multiple=True, help="Artifact to exclude (tts*.wav / subtitles*.srt); repeatable")
 @config_option
 @click.option("--force", is_flag=True, help="Rebuild even if the result already exists")
