@@ -15,12 +15,13 @@ The pipeline runs locally as a series of small, resumable steps. Each step reads
 plain files in a job folder, so you can inspect, rerun, or fix any stage in isolation.
 
 ```mermaid
-flowchart LR
+flowchart TD
     IN([video file]) --> INIT[init]
     INIT --> ASR[transcribe]
     ASR --> TR[translate]
     TR --> SUB[subtitles]
-    TR --> TTS[tts]
+    TR --> ACC[accent]
+    ACC --> TTS[tts]
     SUB --> MUX[mux]
     TTS --> MUX
     MUX --> OUT([dubbed .mp4])
@@ -30,6 +31,7 @@ flowchart LR
 - **transcribe** — speech-to-text of the source audio
 - **translate** — glossary-locked translation of the transcript with an LLM
 - **subtitles** — render the translation to an `.srt` file
+- **accent** — optional per-language text fixes for dubbing (currently Russian stress marks)
 - **tts** — synthesize a dubbed audio track
 - **mux** — combine source video, dubbed audio, and subtitles into the final `.mp4`
 
@@ -109,6 +111,7 @@ uv run glam init lecture.mp4 --glossary glossary.json   # prints the job id, her
 uv run glam transcribe --job-id lecture
 uv run glam translate  --job-id lecture
 uv run glam subtitles  --job-id lecture
+uv run glam accent     --job-id lecture   # Russian only: adds stress marks for the dubbing
 uv run glam tts        --job-id lecture
 uv run glam mux        --job-id lecture
 ```
@@ -136,6 +139,9 @@ terms never drift.
   (it falls back to the job's target, then to `defaults.target`).
 - Translations into several languages coexist in one job — artifacts are named per language
   (`translation.ru.json`, `subtitles.de.srt`, `tts.ru.wav`, …).
+- For Russian, run `accent` before `tts`: it writes `translation.ru.fixed.json` with stress marks,
+  and `tts` picks that up automatically (subtitles keep using the plain translation). You can
+  hand-edit the `.fixed.json` to correct any misplaced stress before dubbing.
 - Choose a dubbing voice with `--voice` on `init` (stored with the job) or on `tts`. Omit it
   to use the server's default voice.
 - `mux` picks up every `tts.*.wav` and `subtitles.*.srt` in the job and adds them all as
@@ -153,6 +159,7 @@ jobs/<job-id>/
   glossary.json         # normalized glossary
   transcript.json       # transcribe output
   translation.<lang>.json
+  translation.<lang>.fixed.json    # accent step (e.g. Russian stress), if run
   subtitles.<lang>.srt
   tts.<lang>[.<voice>].wav
   <name>.mp4            # final muxed video
@@ -169,6 +176,7 @@ uv run glam init <video> [--source LANG] [--target LANG] [--glossary PATH] [--vo
 uv run glam transcribe --job-id ID [--force]
 uv run glam translate  --job-id ID [--target LANG] [--batch-size N] [--context-size N] [--dump] [--force]
 uv run glam subtitles  --job-id ID [--target LANG] [--force]
+uv run glam accent     --job-id ID [--target LANG] [--force]
 uv run glam tts        --job-id ID [--target LANG] [--voice V] [--force]
 uv run glam mux        --job-id ID [--exclude ARTIFACT]... [--force]
 ```

@@ -8,7 +8,7 @@ REQUEST_TIMEOUT_SECONDS = 25 * 60
 
 # The native `/tts` requires a `predefined_voice_id` (the server has no implicit default), so when
 # no voice is resolved we fall back to this built-in predefined voice from the server's voice set.
-DEFAULT_VOICE = "Abigail.wav"
+DEFAULT_VOICE = "Michael.wav"
 
 
 class ChatterboxTtsBackend(TtsBackend):

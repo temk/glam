@@ -148,6 +148,22 @@ def subtitles_cmd(job_id, target, config_path, force):
     subtitles_step.run(job_id, config, target=target, force=force, echo=click.echo)
 
 
+@main.command("accent")
+@job_id_option
+@target_option
+@config_option
+@click.option("--force", is_flag=True, help="Recompute even if the corrected translation already exists")
+@handle_glam_errors
+def accent_cmd(job_id, target, config_path, force):
+    """Apply per-language text fixes (e.g. Russian stress marks) into translation.<lang>.fixed.json."""
+    # Imported here, not at module top, so running one command does not import every step
+    # (this one pulls in torch). See docs/architecture.md "CLI layout".
+    from glam.steps import accent as accent_step
+
+    config = read_config(config_path)
+    accent_step.run(job_id, config, target=target, force=force, echo=click.echo)
+
+
 @main.command("tts")
 @job_id_option
 @target_option

@@ -16,6 +16,11 @@ def translation_filename(target: str) -> str:
     return f"translation.{target}.json"
 
 
+def fixed_translation_filename(target: str) -> str:
+    """Per-target name of the `accent` step's corrected artifact, e.g. `translation.ru.fixed.json`."""
+    return f"translation.{target}.fixed.json"
+
+
 @dataclass
 class TranslatedSegment:
     id: int

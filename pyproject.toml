@@ -10,6 +10,7 @@ dependencies = [
     "pyyaml>=6.0",
     "pysubs2>=1.7",
     "dacite>=1.8",
+    "ruaccent-predictor>=1.2.0",
 ]
 
 [project.scripts]

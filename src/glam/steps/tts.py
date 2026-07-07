@@ -8,7 +8,12 @@ from glam.common.job import JOB_MANIFEST_NAME, read_job_manifest
 from glam.common.config import Config, ServiceName, ServiceConfig
 from glam.common.errors import GlamError
 from glam.backend.tts.base import build_tts_backend
-from glam.common.translation import TranslatedSegment, translation_filename, load_translated_segments
+from glam.common.translation import (
+    TranslatedSegment,
+    translation_filename,
+    load_translated_segments,
+    fixed_translation_filename,
+)
 
 # Artifact is named after the target language; a chosen voice also enters the name
 # because it changes the result (see docs/architecture.md "Artifact names").
@@ -54,13 +59,22 @@ def run(
         echo(f"skip tts, already exists: {output_path}")
         return output_path
 
-    segments = load_translated_segments(job_path / translation_filename(target))
+    segments = load_translated_segments(_translation_source(job_path, target, echo))
     service = config[ServiceName.TTS]
     fragments = _synthesize(segments, service, target, voice, echo)
     _assemble(output_path, segments, fragments)
 
     echo(f"wrote {output_path} ({len(segments)} segments)")
     return output_path
+
+
+def _translation_source(job_path: Path, target: str, echo) -> Path:
+    """Prefer the `accent` step's corrected translation when it exists, else the plain one."""
+    fixed = job_path / fixed_translation_filename(target)
+    if fixed.exists():
+        echo(f"using corrected translation: {fixed.name}")
+        return fixed
+    return job_path / translation_filename(target)
 
 
 def _synthesize(

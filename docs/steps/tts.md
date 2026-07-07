@@ -47,7 +47,9 @@ Expected artifacts:
 
 `tts` reads the target language from `job.yaml`.
 
-The text for speech synthesis is taken only from the `translated_text` field of each segment in `translation.<target>.json`.
+When the `accent` step's corrected artifact `translation.<target>.fixed.json` exists, `tts` reads it in preference to `translation.<target>.json`. This lets dubbing use language-specific fixes (such as Russian stress marks) while `subtitles` keeps reading the plain translation. Both files share the same structure.
+
+The text for speech synthesis is taken only from the `translated_text` field of each segment in the chosen translation artifact.
 
 ## Config
 

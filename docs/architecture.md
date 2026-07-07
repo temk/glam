@@ -8,6 +8,7 @@ Details for specific steps should live in separate files:
 - `docs/steps/transcribe.md`
 - `docs/steps/translate.md`
 - `docs/steps/subtitles.md`
+- `docs/steps/accent.md`
 - `docs/steps/tts.md`
 - `docs/steps/mux.md`
 - `docs/steps/run.md`
@@ -17,8 +18,12 @@ Details for specific steps should live in separate files:
 Main execution order:
 
 ```text
-init → transcribe → translate → subtitles → tts → mux
+init → transcribe → translate → subtitles → accent → tts → mux
 ```
+
+`accent` is optional: it corrects the translated text for languages that need it (currently Russian
+stress marks) and only produces output for those languages. `subtitles` and `accent` both consume
+`translate`'s output and are independent of each other.
 
 `run` is an orchestration command that executes these steps in sequence and skips artifacts that already exist.
 
@@ -32,6 +37,7 @@ Step roles in brief:
 | `transcribe` | Produces a transcript and timestamps through an ASR backend. |
 | `translate` | Translates the transcript through an LLM backend while applying glossary rules. |
 | `subtitles` | Creates a subtitle file from translated segments. |
+| `accent` | Applies per-language text fixes (e.g. Russian stress marks) into `translation.<target>.fixed.json`. |
 | `tts` | Creates a dubbed audio track through a TTS backend. |
 | `mux` | Builds the final video container from the source video, subtitles, and audio tracks. |
 | `run` | Runs the full pipeline end-to-end. |
@@ -121,7 +127,9 @@ voice: nova
 
 `languages.source` and `languages.target` are job-level parameters. They are provided during `init` and are later reused by downstream steps.
 
-`languages.target` is the job's default target language. The `translate`, `subtitles`, and `tts` steps accept `--target` to override it per run and write per-language artifacts (for example `translation.ru.json`, `subtitles.ru.srt`, `tts.ru.wav`), so one job can hold outputs for several languages. `voice` is the job's default TTS voice, which `tts` may override with `--voice`.
+`languages.target` is the job's default target language. The `translate`, `subtitles`, `accent`, and `tts` steps accept `--target` to override it per run and write per-language artifacts (for example `translation.ru.json`, `subtitles.ru.srt`, `translation.ru.fixed.json`, `tts.ru.wav`), so one job can hold outputs for several languages. `voice` is the job's default TTS voice, which `tts` may override with `--voice`.
+
+The `accent` step writes a corrected translation as `translation.<target>.fixed.json`. When it exists, `tts` reads it in preference to `translation.<target>.json`, so dubbing uses the fixed text while `subtitles` keeps reading the plain translation.
 
 ### Job glossary
 
@@ -189,10 +197,11 @@ Local steps:
 
 - `init`
 - `subtitles`
+- `accent`
 - `mux`
 - `run` as an orchestration layer
 
-Local steps may use the filesystem, CPU, and local utilities such as `ffmpeg`, but they must not require a model backend.
+Local steps may use the filesystem, CPU, and local utilities such as `ffmpeg`, but they must not require a remote model backend. `accent` is a local step that may load a bundled local model (the Russian accentor runs on the CPU/GPU of the machine invoking the CLI); it has no configured service entry and makes no network calls.
 
 Remote model-backed steps:
 
@@ -248,7 +257,7 @@ Such errors should use the base error class from `glam.common.errors`.
 - `common/errors.py` — the base error class for the project (`GlamError`);
 - `common/config.py` — `dataclass Config`, its service definitions, and `read_config`, the function for reading the config file;
 - `common/job.py` — the job manifest (`job.yaml`) dataclasses and its read/write helpers;
-- `common/translation.py` — reading and validating the `translation.<target>.json` artifact shared by `subtitles` and `tts`.
+- `common/translation.py` — reading and validating the `translation.<target>.json` artifact shared by `subtitles` and `tts`, plus the per-target artifact names (`translation_filename`, and `fixed_translation_filename` for the `accent` step's `translation.<target>.fixed.json`).
 
 The client for a remote service lives in that service's backend module under `glam.backend` (see "Backends"), not in `glam.common`: `glam.common` is imported by every step, including local ones, and must not pull in a heavy SDK import such as the OpenAI SDK.
 

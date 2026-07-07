@@ -161,6 +161,22 @@ def test_uses_translated_text(tmp_path, patch_chatterbox):
     assert [c["json"]["text"] for c in calls] == ["Привет.", "Мир."]
 
 
+def test_prefers_fixed_translation_when_present(tmp_path, patch_chatterbox):
+    calls = patch_chatterbox()
+    job_path = _make_job(tmp_path)  # writes translation.ru.json
+    fixed = {
+        **TRANSLATION,
+        "segments": [
+            {"id": 0, "start": 0.0, "end": 1.5, "translated_text": "Приве́т."},
+            {"id": 1, "start": 1.5, "end": 3.0, "translated_text": "Ми́р."},
+        ],
+    }
+    (job_path / "translation.ru.fixed.json").write_text(json.dumps(fixed, ensure_ascii=False))
+    tts_step.run("jobA", _chatterbox_config(tmp_path), echo=lambda *_: None)
+
+    assert [c["json"]["text"] for c in calls] == ["Приве́т.", "Ми́р."]  # from the .fixed.json
+
+
 def test_preserves_segment_order(tmp_path, patch_chatterbox):
     calls = patch_chatterbox()
     translation = {
