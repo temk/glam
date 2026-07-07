@@ -15,8 +15,13 @@ class Cue:
     text: str
 
 
-def resegment(segments, cps=DEFAULT_CPS, max_chars_per_line=DEFAULT_MAX_CHARS_PER_LINE,
-              max_lines=DEFAULT_MAX_LINES, min_gap=DEFAULT_MIN_GAP):
+def resegment(
+    segments,
+    cps=DEFAULT_CPS,
+    max_chars_per_line=DEFAULT_MAX_CHARS_PER_LINE,
+    max_lines=DEFAULT_MAX_LINES,
+    min_gap=DEFAULT_MIN_GAP,
+):
     """Turn translated segments into subtitle cues re-timed for reading speed.
 
     Russian translations commonly run longer than the English source, so a segment's

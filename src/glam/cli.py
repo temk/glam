@@ -1,29 +1,37 @@
+import click
 import functools
 from importlib.metadata import version as pkg_version
-from pathlib import Path
 
-import click
-
-from glam import resegment as resegment_defaults
-from glam.config import load_config
-from glam.errors import GlamError
-from glam.steps import init as init_step
-from glam.steps import mux as mux_step
-from glam.steps import subtitles as subtitles_step
-from glam.steps import transcribe as transcribe_step
-from glam.steps import translate as translate_step
-from glam.steps import tts as tts_step
+from glam.common.config import DEFAULT_CONFIG_PATH, read_config
+from glam.common.errors import GlamError
 
 
 def handle_glam_errors(fn):
     """Report GlamError as a clean CLI message instead of a Python traceback."""
+
     @functools.wraps(fn)
     def wrapper(*args, **kwargs):
         try:
             return fn(*args, **kwargs)
         except GlamError as e:
             raise click.ClickException(str(e)) from e
+
     return wrapper
+
+
+config_option = click.option(
+    "-c",
+    "--config",
+    "config_path",
+    default=DEFAULT_CONFIG_PATH,
+    show_default=True,
+    type=click.Path(dir_okay=False),
+    help="Path to config file",
+)
+
+target_option = click.option(
+    "--target", "target", default=None, help="Target language code, overriding the job's target from job.yaml"
+)
 
 
 @click.group()
@@ -39,271 +47,133 @@ def version_cmd():
 
 @main.command("init")
 @click.argument("video_file", type=click.Path(exists=True, dir_okay=False))
-@click.option("--id", "video_id", default=None, help="Job id (default: derived from filename)")
-@click.option("--force", is_flag=True, help="Recompute even if outputs already exist")
 @click.option(
-    "--jobs-dir",
-    default="jobs",
-    show_default=True,
-    type=click.Path(file_okay=False),
-    help="Root directory for job data",
+    "--source", "source_lang", default=None, help="Source/original language code, e.g. en (default: defaults.source)"
 )
+@click.option("--target", "target_lang", default=None, help="Target language code, e.g. ru (default: defaults.target)")
+@click.option(
+    "--glossary",
+    "glossary_path",
+    default=None,
+    type=click.Path(exists=True, dir_okay=False),
+    help="Path to a JSON glossary to copy into the job",
+)
+@click.option("--voice", default=None, help="Default TTS voice for this job, stored in job.yaml")
+@click.option("--job-id", "job_id", default=None, help="Job id (default: derived from filename)")
+@config_option
+@click.option("--force", is_flag=True, help="Recompute even if outputs already exist")
 @handle_glam_errors
-def init_cmd(video_file, video_id, force, jobs_dir):
+def init_cmd(video_file, source_lang, target_lang, glossary_path, voice, job_id, config_path, force):
     """Register a job from a local video file."""
-    job = init_step.run(
+    # Imported here, not at module top, so running one command does not import
+    # every step and its backends. See docs/architecture.md "CLI layout".
+    from glam.steps import init as init_step
+
+    config = read_config(config_path)
+    source_lang = source_lang or config.defaults.source
+    target_lang = target_lang or config.defaults.target
+    if not source_lang or not target_lang:
+        raise click.UsageError(
+            "missing language: pass --source and --target, or set defaults.source/target in the config"
+        )
+    job_path = init_step.run(
         video_file,
-        video_id=video_id,
-        jobs_root=Path(jobs_dir),
+        source_lang=source_lang,
+        target_lang=target_lang,
+        glossary_path=glossary_path,
+        voice=voice,
+        job_id=job_id,
+        jobs_root=config.job_dir,
         force=force,
         echo=click.echo,
     )
-    click.echo(f"job '{job.video_id}' ready at {job.job_dir}")
+    click.echo(f"job '{job_path.name}' ready at {job_path}")
 
 
 @main.command("transcribe")
-@click.argument("video_id")
-@click.option(
-    "-c", "--config", "config_path",
-    default="conf/config.yaml",
-    show_default=True,
-    type=click.Path(exists=True, dir_okay=False),
-    help="Path to config file",
-)
-@click.option("--force", is_flag=True, help="Recompute even if output already exists")
-@click.option(
-    "--jobs-dir",
-    default="jobs",
-    show_default=True,
-    type=click.Path(file_okay=False),
-    help="Root directory for job data",
-)
+@click.argument("job_id")
+@config_option
+@click.option("--force", is_flag=True, help="Recompute even if the transcript already exists")
 @handle_glam_errors
-def transcribe_cmd(video_id, config_path, force, jobs_dir):
-    """Transcribe a job's audio via the configured ASR backend."""
-    config = load_config(config_path)
-    transcript_path = transcribe_step.run(
-        video_id,
-        config,
-        jobs_root=Path(jobs_dir),
-        force=force,
-        echo=click.echo,
-    )
-    click.echo(f"transcript ready at {transcript_path}")
+def transcribe_cmd(job_id, config_path, force):
+    """Transcribe a job's audio through the configured ASR service."""
+    # Imported here, not at module top, so `--help` and local commands do not pull in
+    # the OpenAI SDK. See docs/architecture.md "CLI layout".
+    from glam.steps import transcribe as transcribe_step
+
+    config = read_config(config_path)
+    transcribe_step.run(job_id, config, force=force, echo=click.echo)
 
 
 @main.command("translate")
-@click.argument("video_id")
-@click.option("--lang", required=True, help="Target language code, e.g. ru")
+@click.argument("job_id")
+@target_option
+@config_option
+@click.option("--batch-size", type=int, default=None, help="Segments translated per request (default: 100)")
 @click.option(
-    "-c", "--config", "config_path",
-    default="conf/config.yaml",
-    show_default=True,
-    type=click.Path(exists=True, dir_okay=False),
-    help="Path to config file",
+    "--context-size", type=int, default=None, help="Preceding translated segments sent for context (default: 100)"
 )
 @click.option(
-    "--transcript", "transcript_path",
-    default=None,
-    type=click.Path(exists=True, dir_okay=False),
-    help="Explicit transcript JSON to translate (default: auto-detect from job dir)",
+    "--dump", is_flag=True, default=False, help="Dump each batch's request/response into translate.<lang>.dump/"
 )
-@click.option("--force", is_flag=True, help="Recompute even if output already exists")
-@click.option(
-    "--jobs-dir",
-    default="jobs",
-    show_default=True,
-    type=click.Path(file_okay=False),
-    help="Root directory for job data",
-)
+@click.option("--force", is_flag=True, help="Recompute even if the translation already exists")
 @handle_glam_errors
-def translate_cmd(video_id, lang, config_path, transcript_path, force, jobs_dir):
-    """Translate a job's transcript via the configured LLM backend, applying the glossary."""
-    config = load_config(config_path)
-    output_path = translate_step.run(
-        video_id,
-        config,
-        lang,
-        jobs_root=Path(jobs_dir),
-        transcript_path=transcript_path,
-        force=force,
-        echo=click.echo,
-    )
-    click.echo(f"translation ready at {output_path}")
+def translate_cmd(job_id, target, config_path, batch_size, context_size, dump, force):
+    """Translate a job's transcript through the configured LLM service."""
+    # Imported here, not at module top, so `--help` and local commands do not pull in
+    # the OpenAI SDK. See docs/architecture.md "CLI layout".
+    from glam.steps import translate as translate_step
+
+    # Only forward the tuning options when set, so the step keeps its own defaults.
+    tuning = {k: v for k, v in {"batch_size": batch_size, "context_size": context_size}.items() if v is not None}
+    config = read_config(config_path)
+    translate_step.run(job_id, config, target=target, force=force, echo=click.echo, dump=dump, **tuning)
 
 
 @main.command("subtitles")
-@click.argument("video_id")
-@click.option("--lang", required=True, help="Target language code, e.g. ru")
-@click.option(
-    "--translation", "translation_path",
-    default=None,
-    type=click.Path(exists=True, dir_okay=False),
-    help="Explicit translation JSON (default: auto-detect from job dir)",
-)
-@click.option("--force", is_flag=True, help="Recompute even if output already exists")
-@click.option(
-    "--jobs-dir",
-    default="jobs",
-    show_default=True,
-    type=click.Path(file_okay=False),
-    help="Root directory for job data",
-)
-@click.option("--cps", default=resegment_defaults.DEFAULT_CPS, show_default=True, help="Reading speed, chars/sec")
-@click.option(
-    "--max-chars-per-line",
-    default=resegment_defaults.DEFAULT_MAX_CHARS_PER_LINE,
-    show_default=True,
-)
-@click.option("--max-lines", default=resegment_defaults.DEFAULT_MAX_LINES, show_default=True)
+@click.argument("job_id")
+@target_option
+@config_option
+@click.option("--force", is_flag=True, help="Recompute even if the subtitles already exist")
 @handle_glam_errors
-def subtitles_cmd(video_id, lang, translation_path, force, jobs_dir, cps, max_chars_per_line, max_lines):
-    """Generate .srt subtitles from a job's translation, re-timed for reading speed."""
-    output_path = subtitles_step.run(
-        video_id,
-        lang,
-        jobs_root=Path(jobs_dir),
-        translation_path=translation_path,
-        force=force,
-        cps=cps,
-        max_chars_per_line=max_chars_per_line,
-        max_lines=max_lines,
-        echo=click.echo,
-    )
-    click.echo(f"subtitles ready at {output_path}")
+def subtitles_cmd(job_id, target, config_path, force):
+    """Render a job's translated segments into an SRT subtitle file."""
+    # Imported here, not at module top, so running one command does not import every step.
+    # See docs/architecture.md "CLI layout".
+    from glam.steps import subtitles as subtitles_step
+
+    config = read_config(config_path)
+    subtitles_step.run(job_id, config, target=target, force=force, echo=click.echo)
 
 
 @main.command("tts")
-@click.argument("video_id")
-@click.option("--lang", required=True, help="Target language code, e.g. ru")
-@click.option(
-    "-c", "--config", "config_path",
-    default="conf/config.yaml",
-    show_default=True,
-    type=click.Path(exists=True, dir_okay=False),
-    help="Path to config file",
-)
-@click.option(
-    "--translation", "translation_path",
-    default=None,
-    type=click.Path(exists=True, dir_okay=False),
-    help="Explicit translation JSON (default: auto-detect from job dir)",
-)
-@click.option("--force", is_flag=True, help="Recompute even if outputs already exist")
-@click.option(
-    "--jobs-dir",
-    default="jobs",
-    show_default=True,
-    type=click.Path(file_okay=False),
-    help="Root directory for job data",
-)
+@click.argument("job_id")
+@target_option
+@click.option("--voice", default=None, help="Voice to synthesize with, overriding the job's voice from job.yaml")
+@config_option
+@click.option("--force", is_flag=True, help="Recompute even if the audio track already exists")
 @handle_glam_errors
-def tts_cmd(video_id, lang, config_path, translation_path, force, jobs_dir):
-    """Synthesize a dubbed audio track for a job via the configured TTS backend."""
-    config = load_config(config_path)
-    track_path = tts_step.run(
-        video_id,
-        config,
-        lang,
-        jobs_root=Path(jobs_dir),
-        translation_path=translation_path,
-        force=force,
-        echo=click.echo,
-    )
-    click.echo(f"tts track ready at {track_path}")
+def tts_cmd(job_id, target, voice, config_path, force):
+    """Synthesize a dubbed target-language audio track through the configured TTS service."""
+    # Imported here, not at module top, so `--help` and local commands do not pull in
+    # the OpenAI SDK. See docs/architecture.md "CLI layout".
+    from glam.steps import tts as tts_step
+
+    config = read_config(config_path)
+    tts_step.run(job_id, config, target=target, voice=voice, force=force, echo=click.echo)
 
 
 @main.command("mux")
-@click.argument("video_id")
-@click.option("--lang", required=True, help="Target language code, e.g. ru")
-@click.option("--hardsub", is_flag=True, help="Burn subtitles into the video instead of a soft track")
-@click.option(
-    "--keep-original-audio/--no-keep-original-audio",
-    default=True,
-    help="Include the original-language audio track alongside the dubbed one",
-)
-@click.option(
-    "--subtitles", "subtitles_path",
-    default=None,
-    type=click.Path(exists=True, dir_okay=False),
-    help="Explicit subtitles file (default: auto-detect from job dir)",
-)
-@click.option(
-    "--tts-track", "tts_track_path",
-    default=None,
-    type=click.Path(exists=True, dir_okay=False),
-    help="Explicit dubbed audio track (default: auto-detect from job dir)",
-)
-@click.option("--force", is_flag=True, help="Recompute even if output already exists")
-@click.option(
-    "--jobs-dir",
-    default="jobs",
-    show_default=True,
-    type=click.Path(file_okay=False),
-    help="Root directory for job data",
-)
+@click.argument("job_id")
+@click.option("--exclude", "exclude", multiple=True, help="Artifact to exclude (tts*.wav / subtitles*.srt); repeatable")
+@config_option
+@click.option("--force", is_flag=True, help="Rebuild even if the result already exists")
 @handle_glam_errors
-def mux_cmd(video_id, lang, hardsub, keep_original_audio, subtitles_path, tts_track_path, force, jobs_dir):
-    """Mux source video, original + dubbed audio, and subtitles into the final output."""
-    output_path = mux_step.run(
-        video_id,
-        lang,
-        jobs_root=Path(jobs_dir),
-        hardsub=hardsub,
-        keep_original_audio=keep_original_audio,
-        subtitles_path=subtitles_path,
-        tts_track_path=tts_track_path,
-        force=force,
-        echo=click.echo,
-    )
-    click.echo(f"output ready at {output_path}")
+def mux_cmd(job_id, exclude, config_path, force):
+    """Build the final MP4 from the source video, TTS tracks, and subtitles."""
+    # Imported here, not at module top, so running one command does not import every step.
+    # See docs/architecture.md "CLI layout".
+    from glam.steps import mux as mux_step
 
-
-@main.command("run")
-@click.argument("video_file", type=click.Path(exists=True, dir_okay=False))
-@click.option("--lang", required=True, help="Target language code, e.g. ru")
-@click.option("--id", "video_id", default=None, help="Job id (default: derived from filename)")
-@click.option(
-    "-c", "--config", "config_path",
-    default="conf/config.yaml",
-    show_default=True,
-    type=click.Path(exists=True, dir_okay=False),
-    help="Path to config file",
-)
-@click.option("--hardsub", is_flag=True, help="Burn subtitles into the video instead of a soft track")
-@click.option(
-    "--keep-original-audio/--no-keep-original-audio",
-    default=True,
-    help="Include the original-language audio track alongside the dubbed one",
-)
-@click.option("--force", is_flag=True, help="Recompute every step even if outputs already exist")
-@click.option(
-    "--jobs-dir",
-    default="jobs",
-    show_default=True,
-    type=click.Path(file_okay=False),
-    help="Root directory for job data",
-)
-@handle_glam_errors
-def run_cmd(video_file, lang, video_id, config_path, hardsub, keep_original_audio, force, jobs_dir):
-    """Run the full pipeline for a video file, skipping cached steps."""
-    config = load_config(config_path)
-    jobs_root = Path(jobs_dir)
-
-    job = init_step.run(video_file, video_id=video_id, jobs_root=jobs_root, force=force, echo=click.echo)
-    resolved_id = job.video_id
-
-    transcribe_step.run(resolved_id, config, jobs_root=jobs_root, force=force, echo=click.echo)
-    translate_step.run(resolved_id, config, lang, jobs_root=jobs_root, force=force, echo=click.echo)
-    subtitles_step.run(resolved_id, lang, jobs_root=jobs_root, force=force, echo=click.echo)
-    tts_step.run(resolved_id, config, lang, jobs_root=jobs_root, force=force, echo=click.echo)
-    output_path = mux_step.run(
-        resolved_id,
-        lang,
-        jobs_root=jobs_root,
-        hardsub=hardsub,
-        keep_original_audio=keep_original_audio,
-        force=force,
-        echo=click.echo,
-    )
-    click.echo(f"pipeline complete: {output_path}")
+    config = read_config(config_path)
+    mux_step.run(job_id, config, exclude=exclude, force=force, echo=click.echo)

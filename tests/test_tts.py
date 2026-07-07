@@ -1,210 +1,390 @@
+import io
 import json
 import wave
+import httpx
+import openai
+import pytest
+from types import SimpleNamespace
 from pathlib import Path
 
-import ffmpeg
-import pytest
+from glam.steps import tts as tts_step
+from glam.steps.tts import TtsError
+from glam.common.job import JobInfo, Languages, SourceInfo, JobManifest, write_job_manifest
+from glam.common.config import Config, Protocol, ConfigError, ServiceName, ServiceConfig
+from glam.backend.tts.base import TtsBackendError
+from glam.common.translation import TranslationError
+from glam.backend.tts.chatterbox import DEFAULT_VOICE as CHATTERBOX_DEFAULT_VOICE
 
-from glam import media
-from glam.errors import GlamError
-from glam.steps import tts
+FRAMERATE = 16000
+
+TRANSLATION = {
+    "version": 1,
+    "step": "translate",
+    "job_id": "jobA",
+    "source_language": "en",
+    "model": "llm-x",
+    "audio_artifact": "audio.wav",
+    "segments": [
+        {"id": 0, "start": 0.0, "end": 1.5, "text": "Hello.", "translated_text": "Привет."},
+        {"id": 1, "start": 1.5, "end": 3.0, "text": "World.", "translated_text": "Мир."},
+    ],
+}
 
 
-def make_tone_wav(path, duration, sample_rate=22050):
-    (
-        ffmpeg
-        .input(f"sine=frequency=440:duration={duration}", f="lavfi")
-        .output(str(path), format="wav", ar=sample_rate, ac=1, acodec="pcm_s16le")
-        .overwrite_output()
-        .run(quiet=True)
+def _wav_bytes(seconds: float, framerate: int = FRAMERATE, nchannels: int = 1, sampwidth: int = 2) -> bytes:
+    buf = io.BytesIO()
+    with wave.open(buf, "wb") as w:
+        w.setnchannels(nchannels)
+        w.setsampwidth(sampwidth)
+        w.setframerate(framerate)
+        # Non-zero samples so synthesized audio is distinguishable from inserted silence.
+        w.writeframes(b"\x11\x11" * (round(seconds * framerate) * nchannels))
+    return buf.getvalue()
+
+
+def _wav_duration(data: bytes) -> float:
+    with wave.open(io.BytesIO(data), "rb") as w:
+        return w.getnframes() / w.getframerate()
+
+
+def _make_job(
+    tmp_path: Path, job_id: str = "jobA", translation: dict | None = TRANSLATION, voice: str | None = None
+) -> Path:
+    job_path = tmp_path / job_id
+    job_path.mkdir(parents=True)
+    manifest = JobManifest(
+        version=1,
+        job=JobInfo(id=job_id, created_at="2026-07-05T00:00:00+00:00"),
+        source=SourceInfo(
+            original_path="/x/video.mp4",
+            filename="video.mp4",
+            artifact="source.mp4",
+            audio_artifact="audio.wav",
+            duration_seconds=3.0,
+        ),
+        languages=Languages(source="en", target="ru"),
+        voice=voice,
     )
+    write_job_manifest(manifest, job_path / "job.yaml")
+    if translation is not None:
+        (job_path / "translation.ru.json").write_text(json.dumps(translation, ensure_ascii=False, indent=2))
+    return job_path
 
 
-class FakeSpeechResponse:
-    def __init__(self, duration):
-        self.duration = duration
-
-    def stream_to_file(self, path):
-        make_tone_wav(Path(path), self.duration)
-
-
-class FakeSpeech:
-    def __init__(self, durations):
-        self._durations = list(durations)
-        self.calls = []
-
-    def create(self, **kwargs):
-        self.calls.append(kwargs)
-        duration = self._durations.pop(0)
-        return FakeSpeechResponse(duration)
+def _chatterbox_config(tmp_path: Path, with_service: bool = True) -> Config:
+    services = []
+    if with_service:
+        services.append(ServiceConfig(name=ServiceName.TTS, protocol=Protocol.CHATTERBOX, url="http://tts:8004"))
+    return Config(services=services, job_dir=tmp_path)
 
 
-class FakeClient:
-    def __init__(self, durations):
-        self.audio = _Audio(durations)
+def _openai_config(tmp_path: Path, params: dict | None = None) -> Config:
+    service = ServiceConfig(
+        name=ServiceName.TTS, protocol=Protocol.OPENAI, url="http://tts/v1", params=params or {"model": "tts-x"}
+    )
+    return Config(services=[service], job_dir=tmp_path)
 
 
-class _Audio:
-    def __init__(self, durations):
-        self.speech = FakeSpeech(durations)
+# --- fake backends ---
 
 
-def make_config(model="fake-tts", voice="default", **overrides):
-    tts_cfg = {
-        "backend": "openai_compatible",
-        "base_url": "http://fake-host:9000/v1",
-        "model": model,
-        "voice": voice,
+class _FakeResponse:
+    def __init__(self, content: bytes) -> None:
+        self.content = content
+
+    def raise_for_status(self) -> None:
+        pass
+
+
+@pytest.fixture
+def patch_chatterbox(monkeypatch):
+    """Patch httpx.Client used by the chatterbox backend; return recorded POST payloads."""
+
+    def install(audio=None, post_error=None):
+        calls: list[dict] = []
+
+        class FakeClient:
+            def __init__(self, **kwargs):
+                pass
+
+            def post(self, url, json):
+                calls.append({"url": url, "json": json})
+                if post_error is not None:
+                    raise post_error
+                content = audio(json) if callable(audio) else _wav_bytes(0.5)
+                return _FakeResponse(content)
+
+        monkeypatch.setattr("httpx.Client", FakeClient)
+        return calls
+
+    return install
+
+
+@pytest.fixture
+def patch_openai(monkeypatch):
+    """Patch openai.OpenAI used by the openai backend; return recorded request kwargs."""
+
+    def install(audio=None, error=None):
+        calls: list[dict] = []
+
+        def create(**kwargs):
+            calls.append(kwargs)
+            if error is not None:
+                raise error
+            content = audio(kwargs) if callable(audio) else _wav_bytes(0.5)
+            return SimpleNamespace(content=content)
+
+        client = SimpleNamespace(audio=SimpleNamespace(speech=SimpleNamespace(create=create)))
+        monkeypatch.setattr("openai.OpenAI", lambda **kwargs: client)
+        return calls
+
+    return install
+
+
+# --- protocol-agnostic step behavior (exercised through the chatterbox backend) ---
+
+
+def test_creates_audio_track(tmp_path, patch_chatterbox):
+    patch_chatterbox()
+    _make_job(tmp_path)
+    path = tts_step.run("jobA", _chatterbox_config(tmp_path), echo=lambda *_: None)
+
+    assert path.name == "tts.ru.wav"
+    assert path.exists()
+
+
+def test_uses_translated_text(tmp_path, patch_chatterbox):
+    calls = patch_chatterbox()
+    _make_job(tmp_path)
+    tts_step.run("jobA", _chatterbox_config(tmp_path), echo=lambda *_: None)
+
+    assert [c["json"]["text"] for c in calls] == ["Привет.", "Мир."]
+
+
+def test_preserves_segment_order(tmp_path, patch_chatterbox):
+    calls = patch_chatterbox()
+    translation = {
+        **TRANSLATION,
+        "segments": [
+            {"id": 0, "start": 0.0, "end": 1.0, "translated_text": "первый"},
+            {"id": 1, "start": 1.0, "end": 2.0, "translated_text": "второй"},
+            {"id": 2, "start": 2.0, "end": 3.0, "translated_text": "третий"},
+        ],
     }
-    tts_cfg.update(overrides)
-    return {"steps": {"tts": tts_cfg}}
+    _make_job(tmp_path, translation=translation)
+    tts_step.run("jobA", _chatterbox_config(tmp_path), echo=lambda *_: None)
+
+    assert [c["json"]["text"] for c in calls] == ["первый", "второй", "третий"]
 
 
-def write_translation(job_dir, lang="ru", model="fake-model", segments=None):
-    job_dir.mkdir(parents=True, exist_ok=True)
-    segments = segments or [
-        {"id": 0, "start": 0.0, "end": 1.0, "text": "привет"},
-        {"id": 1, "start": 1.0, "end": 2.0, "text": "мир"},
-    ]
-    path = job_dir / f"translation.{lang}.{model}.json"
-    path.write_text(json.dumps({"model": model, "lang": lang, "segments": segments}))
-    return path
+def test_inserts_silence_between_segments(tmp_path, patch_chatterbox):
+    translation = {
+        **TRANSLATION,
+        "segments": [
+            {"id": 0, "start": 0.0, "end": 1.0, "translated_text": "a"},
+            {"id": 1, "start": 2.0, "end": 3.0, "translated_text": "b"},
+        ],
+    }
+    patch_chatterbox(audio=lambda payload: _wav_bytes(0.5))
+    job_path = _make_job(tmp_path, translation=translation)
+    path = tts_step.run("jobA", _chatterbox_config(tmp_path), echo=lambda *_: None)
+
+    # 0.5 (frag) + 1.5 (silence to reach start=2.0) + 0.5 (frag) = 2.5s
+    assert _wav_duration((job_path / path.name).read_bytes()) == pytest.approx(2.5, abs=1e-3)
 
 
-def test_tts_writes_segment_clips_and_track(tmp_path, monkeypatch):
-    job_dir = tmp_path / "jobs" / "myvid"
-    write_translation(job_dir)
+def test_overlong_fragment_pushes_later_without_trimming(tmp_path, patch_chatterbox):
+    translation = {
+        **TRANSLATION,
+        "segments": [
+            {"id": 0, "start": 0.0, "end": 0.4, "translated_text": "long"},
+            {"id": 1, "start": 0.4, "end": 1.0, "translated_text": "next"},
+        ],
+    }
+    durations = iter([1.0, 0.5])
+    patch_chatterbox(audio=lambda payload: _wav_bytes(next(durations)))
+    job_path = _make_job(tmp_path, translation=translation)
+    path = tts_step.run("jobA", _chatterbox_config(tmp_path), echo=lambda *_: None)
 
-    fake_client = FakeClient([1.0, 1.0])
-    monkeypatch.setattr(tts, "build_openai_client", lambda cfg: fake_client)
+    # No silence, no trimming: total is exactly the two fragments back to back (1.0 + 0.5).
+    assert _wav_duration((job_path / path.name).read_bytes()) == pytest.approx(1.5, abs=1e-3)
 
-    track_path = tts.run(
-        "myvid", make_config(), "ru", jobs_root=tmp_path / "jobs", echo=lambda *_: None
+
+def test_format_mismatch_is_assembly_error(tmp_path, patch_chatterbox):
+    rates = iter([16000, 8000])
+    patch_chatterbox(audio=lambda payload: _wav_bytes(0.5, framerate=next(rates)))
+    _make_job(tmp_path)
+    with pytest.raises(TtsError, match="unable to assemble"):
+        tts_step.run("jobA", _chatterbox_config(tmp_path), echo=lambda *_: None)
+
+
+def test_skips_if_exists(tmp_path, patch_chatterbox):
+    calls = patch_chatterbox()
+    job_path = _make_job(tmp_path)
+    (job_path / "tts.ru.wav").write_bytes(b"stale")
+
+    tts_step.run("jobA", _chatterbox_config(tmp_path), echo=lambda *_: None)
+    assert (job_path / "tts.ru.wav").read_bytes() == b"stale"
+    assert calls == []  # no synthesis when skipping
+
+
+def test_force_recreates(tmp_path, patch_chatterbox):
+    patch_chatterbox()
+    job_path = _make_job(tmp_path)
+    (job_path / "tts.ru.wav").write_bytes(b"stale")
+
+    tts_step.run("jobA", _chatterbox_config(tmp_path), force=True, echo=lambda *_: None)
+    assert (job_path / "tts.ru.wav").read_bytes() != b"stale"
+
+
+def test_target_override_reads_and_names_that_language(tmp_path, patch_chatterbox):
+    calls = patch_chatterbox()
+    job_path = _make_job(tmp_path)  # translation.ru.json; job target ru
+    (job_path / "translation.de.json").write_text(
+        json.dumps({"segments": [{"id": 0, "start": 0.0, "end": 1.0, "translated_text": "Hallo"}]})
+    )
+    path = tts_step.run("jobA", _chatterbox_config(tmp_path), target="de", echo=lambda *_: None)
+
+    assert path.name == "tts.de.wav"
+    assert calls[0]["json"]["language"] == "de"
+
+
+def test_reports_progress(tmp_path, patch_chatterbox):
+    patch_chatterbox()
+    _make_job(tmp_path)
+    messages: list[str] = []
+    tts_step.run("jobA", _chatterbox_config(tmp_path), echo=messages.append)
+
+    assert any("synthesizing segment 1/2" in m for m in messages)
+    assert any("wrote" in m and "tts.ru.wav" in m for m in messages)
+
+
+def test_missing_translation(tmp_path, patch_chatterbox):
+    patch_chatterbox()
+    job_path = _make_job(tmp_path)
+    (job_path / "translation.ru.json").unlink()
+    with pytest.raises(TranslationError, match="missing translation artifact"):
+        tts_step.run("jobA", _chatterbox_config(tmp_path), echo=lambda *_: None)
+
+
+def test_invalid_translation_format(tmp_path, patch_chatterbox):
+    patch_chatterbox()
+    job_path = _make_job(tmp_path)
+    (job_path / "translation.ru.json").write_text("{ not json")
+    with pytest.raises(TranslationError, match="invalid translation"):
+        tts_step.run("jobA", _chatterbox_config(tmp_path), echo=lambda *_: None)
+
+
+def test_missing_translated_text(tmp_path, patch_chatterbox):
+    patch_chatterbox()
+    translation = {**TRANSLATION, "segments": [{"id": 0, "start": 0.0, "end": 1.0}]}
+    _make_job(tmp_path, translation=translation)
+    with pytest.raises(TranslationError, match="missing 'translated_text'"):
+        tts_step.run("jobA", _chatterbox_config(tmp_path), echo=lambda *_: None)
+
+
+def test_invalid_timestamps(tmp_path, patch_chatterbox):
+    patch_chatterbox()
+    translation = {**TRANSLATION, "segments": [{"id": 0, "start": 2.0, "end": 1.0, "translated_text": "t"}]}
+    _make_job(tmp_path, translation=translation)
+    with pytest.raises(TranslationError, match="end <= start"):
+        tts_step.run("jobA", _chatterbox_config(tmp_path), echo=lambda *_: None)
+
+
+def test_missing_tts_service(tmp_path, patch_chatterbox):
+    patch_chatterbox()
+    _make_job(tmp_path)
+    with pytest.raises(ConfigError, match="not defined in the config"):
+        tts_step.run("jobA", _chatterbox_config(tmp_path, with_service=False), echo=lambda *_: None)
+
+
+# --- chatterbox protocol specifics ---
+
+
+def test_chatterbox_posts_to_tts_endpoint_with_language(tmp_path, patch_chatterbox):
+    calls = patch_chatterbox()
+    _make_job(tmp_path)
+    tts_step.run("jobA", _chatterbox_config(tmp_path), echo=lambda *_: None)
+
+    assert all(c["url"] == "http://tts:8004/tts" for c in calls)
+    assert all(c["json"]["language"] == "ru" for c in calls)
+    assert all(c["json"]["output_format"] == "wav" for c in calls)
+
+
+def test_chatterbox_uses_default_voice_when_unset(tmp_path, patch_chatterbox):
+    calls = patch_chatterbox()
+    _make_job(tmp_path)  # no --voice, no job voice
+    path = tts_step.run("jobA", _chatterbox_config(tmp_path), echo=lambda *_: None)
+
+    # The server requires a predefined voice, so the backend falls back to its built-in default;
+    # a fallback default does not enter the artifact name.
+    assert path.name == "tts.ru.wav"
+    assert all(c["json"]["predefined_voice_id"] == CHATTERBOX_DEFAULT_VOICE for c in calls)
+
+
+def test_chatterbox_sends_voice_when_set(tmp_path, patch_chatterbox):
+    calls = patch_chatterbox()
+    _make_job(tmp_path, voice="female_01")  # voice from job.yaml
+    path = tts_step.run("jobA", _chatterbox_config(tmp_path), echo=lambda *_: None)
+
+    assert path.name == "tts.ru.female_01.wav"
+    assert all(c["json"]["predefined_voice_id"] == "female_01" for c in calls)
+
+
+def test_chatterbox_backend_unavailable(tmp_path, patch_chatterbox):
+    patch_chatterbox(post_error=httpx.ConnectError("connection refused"))
+    _make_job(tmp_path)
+    with pytest.raises(TtsBackendError, match="request failed"):
+        tts_step.run("jobA", _chatterbox_config(tmp_path), echo=lambda *_: None)
+
+
+def test_chatterbox_invalid_response(tmp_path, patch_chatterbox):
+    patch_chatterbox(audio=lambda payload: b"not a wav file")
+    _make_job(tmp_path)
+    with pytest.raises(TtsError, match="invalid response"):
+        tts_step.run("jobA", _chatterbox_config(tmp_path), echo=lambda *_: None)
+
+
+# --- openai protocol specifics ---
+
+
+def test_openai_requires_voice(tmp_path, patch_openai):
+    patch_openai()
+    _make_job(tmp_path)  # no voice anywhere
+    with pytest.raises(TtsBackendError, match="requires a voice"):
+        tts_step.run("jobA", _openai_config(tmp_path), echo=lambda *_: None)
+
+
+def test_openai_uses_params_voice(tmp_path, patch_openai):
+    calls = patch_openai()
+    _make_job(tmp_path)
+    path = tts_step.run(
+        "jobA", _openai_config(tmp_path, params={"model": "tts-x", "voice": "alloy"}), echo=lambda *_: None
     )
 
-    assert track_path == job_dir / "tts_track.ru.fake-tts.default.wav"
-    assert track_path.exists()
-
-    segments_dir = job_dir / "tts_segments.ru.fake-tts.default"
-    assert (segments_dir / "0000.wav").exists()
-    assert (segments_dir / "0001.wav").exists()
-
-    track_duration = media.probe_duration(track_path)
-    assert track_duration == pytest.approx(2.0, abs=0.1)
-
-    assert len(fake_client.audio.speech.calls) == 2
-    assert fake_client.audio.speech.calls[0]["model"] == "fake-tts"
-    assert fake_client.audio.speech.calls[0]["voice"] == "default"
-    assert fake_client.audio.speech.calls[0]["input"] == "привет"
+    # params.voice fills the request but is a config default, so it does not enter the artifact name.
+    assert path.name == "tts.ru.wav"
+    assert all(c["voice"] == "alloy" for c in calls)
+    assert all(c["model"] == "tts-x" for c in calls)
+    assert [c["input"] for c in calls] == ["Привет.", "Мир."]
 
 
-def test_tts_empty_segment_text_writes_silence_without_calling_backend(tmp_path, monkeypatch):
-    job_dir = tmp_path / "jobs" / "myvid"
-    write_translation(job_dir, segments=[
-        {"id": 0, "start": 0.0, "end": 1.0, "text": "  "},
-        {"id": 1, "start": 1.0, "end": 2.0, "text": "мир"},
-    ])
-
-    fake_client = FakeClient([1.0])
-    monkeypatch.setattr(tts, "build_openai_client", lambda cfg: fake_client)
-
-    tts.run("myvid", make_config(), "ru", jobs_root=tmp_path / "jobs", echo=lambda *_: None)
-
-    assert len(fake_client.audio.speech.calls) == 1  # only the non-empty segment
-
-
-def test_tts_is_idempotent_at_track_level(tmp_path, monkeypatch):
-    job_dir = tmp_path / "jobs" / "myvid"
-    write_translation(job_dir)
-    track_path = job_dir / "tts_track.ru.fake-tts.default.wav"
-    job_dir.mkdir(parents=True, exist_ok=True)
-    track_path.write_bytes(b"already there")
-
-    fake_client = FakeClient([])
-    monkeypatch.setattr(tts, "build_openai_client", lambda cfg: fake_client)
-
-    result_path = tts.run(
-        "myvid", make_config(), "ru", jobs_root=tmp_path / "jobs", echo=lambda *_: None
+def test_openai_cli_voice_overrides_params_voice(tmp_path, patch_openai):
+    calls = patch_openai()
+    _make_job(tmp_path, voice="echo")  # job voice
+    path = tts_step.run(
+        "jobA",
+        _openai_config(tmp_path, params={"model": "tts-x", "voice": "alloy"}),
+        voice="nova",
+        echo=lambda *_: None,
     )
 
-    assert result_path == track_path
-    assert track_path.read_bytes() == b"already there"
-    assert fake_client.audio.speech.calls == []
+    assert path.name == "tts.ru.nova.wav"  # --voice wins and enters the name
+    assert all(c["voice"] == "nova" for c in calls)
 
 
-def test_tts_reuses_existing_segment_clips_without_track(tmp_path, monkeypatch):
-    job_dir = tmp_path / "jobs" / "myvid"
-    write_translation(job_dir)
-    segments_dir = job_dir / "tts_segments.ru.fake-tts.default"
-    segments_dir.mkdir(parents=True)
-    make_tone_wav(segments_dir / "0000.wav", 1.0)
-
-    fake_client = FakeClient([1.0])  # only segment 1 needs synthesis
-    monkeypatch.setattr(tts, "build_openai_client", lambda cfg: fake_client)
-
-    tts.run("myvid", make_config(), "ru", jobs_root=tmp_path / "jobs", echo=lambda *_: None)
-
-    assert len(fake_client.audio.speech.calls) == 1
-
-
-def test_tts_force_regenerates_all_clips(tmp_path, monkeypatch):
-    job_dir = tmp_path / "jobs" / "myvid"
-    write_translation(job_dir)
-    track_path = job_dir / "tts_track.ru.fake-tts.default.wav"
-    job_dir.mkdir(parents=True, exist_ok=True)
-    track_path.write_bytes(b"stale")
-
-    fake_client = FakeClient([1.0, 1.0])
-    monkeypatch.setattr(tts, "build_openai_client", lambda cfg: fake_client)
-
-    tts.run(
-        "myvid", make_config(), "ru", jobs_root=tmp_path / "jobs",
-        force=True, echo=lambda *_: None,
-    )
-
-    assert len(fake_client.audio.speech.calls) == 2
-
-
-def test_tts_missing_translation_raises(tmp_path, monkeypatch):
-    (tmp_path / "jobs" / "myvid").mkdir(parents=True)
-    fake_client = FakeClient([])
-    monkeypatch.setattr(tts, "build_openai_client", lambda cfg: fake_client)
-
-    with pytest.raises(GlamError):
-        tts.run("myvid", make_config(), "ru", jobs_root=tmp_path / "jobs", echo=lambda *_: None)
-
-
-def test_finalize_clip_corrects_duration_within_atempo_bound(tmp_path):
-    raw = tmp_path / "raw.wav"
-    out = tmp_path / "out.wav"
-    make_tone_wav(raw, 1.1)  # 10% over target, well within default 1.3x bound
-
-    tts._finalize_clip(raw, out, target_duration=1.0, sample_rate=22050, max_atempo=1.3)
-
-    assert media.probe_duration(out) == pytest.approx(1.0, abs=0.05)
-
-
-def test_finalize_clip_clamps_extreme_ratio_instead_of_forcing_exact_target(tmp_path):
-    raw = tmp_path / "raw.wav"
-    out = tmp_path / "out.wav"
-    make_tone_wav(raw, 2.0)  # 2x target — beyond the 1.3x correction bound
-
-    tts._finalize_clip(raw, out, target_duration=1.0, sample_rate=22050, max_atempo=1.3)
-
-    result_duration = media.probe_duration(out)
-    assert result_duration == pytest.approx(2.0 / 1.3, abs=0.05)
-    assert result_duration > 1.0  # confirms it did NOT hit the target, by design
-
-
-def test_assemble_track_inserts_silence_gaps(tmp_path):
-    clip_a = tmp_path / "a.wav"
-    clip_b = tmp_path / "b.wav"
-    make_tone_wav(clip_a, 1.0, sample_rate=22050)
-    make_tone_wav(clip_b, 1.0, sample_rate=22050)
-    out = tmp_path / "track.wav"
-
-    tts._assemble_track([clip_a, clip_b], [0.0, 3.0], out, sample_rate=22050)
-
-    with wave.open(str(out), "rb") as f:
-        total_duration = f.getnframes() / f.getframerate()
-    assert total_duration == pytest.approx(4.0, abs=0.01)
+def test_openai_backend_unavailable(tmp_path, patch_openai):
+    patch_openai(error=openai.OpenAIError("connection refused"))
+    _make_job(tmp_path, voice="alloy")
+    with pytest.raises(TtsBackendError, match="request failed"):
+        tts_step.run("jobA", _openai_config(tmp_path), echo=lambda *_: None)

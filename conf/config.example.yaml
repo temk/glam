@@ -1,28 +1,36 @@
-# Copy to conf/config.local.yaml and fill in your actual inference host(s).
-# See docs/architecture.md for the full schema and rationale.
-target_lang: ru
-source_lang: en
+job_dir: ./jobs
 
-steps:
-  asr:
-    backend: openai_compatible
-    base_url: http://<inference-host>:8000/v1
-    model: Systran/faster-whisper-large-v3
-    api_key_env: LOCAL_API_KEY
-    # timestamp_granularities: [segment, word]   # default; drop "word" if the backend rejects it
-  translate:
-    backend: openai_compatible
-    base_url: http://<inference-host>:11434/v1
-    model: qwen2.5:7b
-    api_key_env: LOCAL_API_KEY
-    glossary: ./conf/glossary.example.txt
-  tts:
-    backend: openai_compatible
-    base_url: http://<inference-host>:PORT/v1     # TBD once the TTS service is deployed
-    model: xtts-v2
-    voice: default
-    api_key_env: LOCAL_API_KEY
+# Optional default languages; `init` uses these when --source/--target are omitted.
+defaults:
+  source: en
+  target: ru
 
-mux:
-  keep_original_audio: true
-  hardsub: false
+services:
+  - name: transcribe
+    protocol: openai
+    url: http://<inference-host>:8000/v1
+    params:
+      model: Systran/faster-whisper-large-v3
+
+  - name: translate
+    protocol: openai
+    url: http://<inference-host>:11434/v1
+    params:
+      model: qwen2.5:7b
+      api_key: MY_SECRET_KEY
+
+  # Native Chatterbox-TTS-Server: `url` is the server root, the backend appends `/tts`.
+  # The target language is sent per request; a built-in default voice is used unless --voice or the
+  # job's voice is set.
+  - name: tts
+    protocol: chatterbox
+    url: http://<inference-host>:8004
+
+  # OpenAI-compatible TTS alternative. The OpenAI speech protocol requires a voice, so set a
+  # default `voice` here or pass `--voice` per run.
+  # - name: tts
+  #   protocol: openai
+  #   url: http://<inference-host>:PORT/v1
+  #   params:
+  #     model: xtts-v2
+  #     voice: alloy

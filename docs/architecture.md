@@ -1,217 +1,322 @@
-# GLAM — Architecture
+# GLAM — General Architecture
 
-GLAM (Glossary-Locked Audio Muxer) — video translation pipeline: ASR → LLM translation with a technical-glossary system → subtitles + TTS dubbing → mux.
+This document describes only the high-level architecture of GLAM: the pipeline step order, shared execution parameters, the general configuration format, and the boundary between local execution and remote model-backed services.
 
-Last updated: 2026-07-01
+Details for specific steps should live in separate files:
 
-## Goals
-
-- Translate videos (primarily English-source technical/educational content) into Russian or another target language, producing translated subtitles and a dubbed audio track.
-- Motivation: (1) not everything is translated by content platforms; (2) generic machine translation (e.g. Google) frequently mistranslates technical jargon literally — *loss*, *inference*, *distribution* — where practitioners expect the English term preserved.
-- Every model-backed step must be swappable between the local cluster and a commercial API without touching pipeline code — configuration only.
-
-## Pipeline overview
-
-```mermaid
-flowchart TD
-    IN([Input video file]) --> INIT[init<br/>register job, extract audio]
-    INIT --> ASR[transcribe<br/>ASR]
-    ASR --> TR[translate<br/>LLM + glossary]
-    TR --> SUB[subtitles<br/>.srt]
-    TR --> TTS[tts<br/>voice synthesis]
-    SUB --> MUX[mux<br/>ffmpeg]
-    TTS --> MUX
-    MUX --> OUT([Output .mkv])
-```
-
-## Design principles
-
-1. **OpenAI-compatible protocol for all model-backed steps.** ASR, translation, and TTS are called over HTTP using the OpenAI API shape (`/v1/audio/transcriptions`, `/v1/chat/completions`, `/v1/audio/speech`). This is what self-hosted inference servers (Ollama, vLLM, TGI, most Whisper/TTS wrappers) speak natively, and it's OpenAI's own native format. Swapping a backend is a config change (`base_url`, `model`, `api_key`), never a code change.
-   Anthropic and Gemini APIs don't share this schema natively. If needed later, route through a small adapter or a [LiteLLM](https://github.com/BerriAI/litellm) proxy that normalizes multiple providers behind one OpenAI-compatible interface — verify its audio (ASR/TTS) endpoint coverage separately from chat, it's most mature for chat completions.
-2. **Every step is an idempotent CLI command with explicit file input/output.** A step does not recompute if its output already exists, unless forced.
-3. **Outputs are versioned by backend/model in the filename, never overwritten.** Multiple translations (e.g. local Qwen vs. GPT-4o) can coexist for comparison; a re-run never silently replaces a prior result.
-4. **The pipeline does not acquire video.** It takes a local video file as input (see [Job directory](#job-directory--caching)). Downloading is handled outside the pipeline, by a separate tool.
-
-## Deployment topology
-
-The orchestrator and both `ffmpeg`-based steps (audio extraction, final mux) run wherever the CLI is invoked — a laptop, a workstation, a CI runner, doesn't matter. Model inference (ASR, LLM, TTS) is reached purely over HTTP and can live anywhere: a local GPU box on the same LAN, a self-hosted cluster, or a commercial API. Nothing on the inference side needs to know the pipeline exists — it's just an OpenAI-compatible HTTP client talking to whatever `base_url` is configured per step.
-
-```mermaid
-flowchart LR
-    subgraph Runner["Wherever the CLI runs"]
-        CLI[glam CLI]
-        FFM[ffmpeg]
-    end
-    subgraph Backend["Inference backend(s) — local or commercial"]
-        ASRSVC["ASR endpoint"]
-        LLMSVC["LLM endpoint"]
-        TTSSVC["TTS endpoint"]
-    end
-    CLI -- "HTTP, OpenAI-compatible" --> ASRSVC
-    CLI -- "HTTP, OpenAI-compatible" --> LLMSVC
-    CLI -- "HTTP, OpenAI-compatible" --> TTSSVC
-    CLI --> FFM
-```
-
-**Network note:** each step's `base_url` must be reachable from wherever the pipeline actually runs. If pointing at a local/LAN inference host, verify hostname resolution (or use a fixed IP) from that specific machine — don't assume it already resolves everywhere on the network.
-
-## Reference deployment (example)
-
-Any OpenAI-compatible backend works — this is just one working example, not a requirement:
-
-| Capability | Status | Details |
-|---|---|---|
-| ASR | Ready | `speaches` (`ghcr.io/speaches-ai/speaches:latest-cuda`), model `Systran/faster-whisper-large-v3`, port 8000, OpenAI-compatible `/v1/audio/transcriptions`. ~7.4GB VRAM while loaded, unloads after 300s idle. |
-| Translation (LLM) | Mostly ready | Ollama, model `qwen2.5:7b`, port 11434, context length 16384. OpenAI-compatible `/v1/chat/completions` should be available by default — **not yet confirmed**, verify with a direct request before wiring into config. Model was chosen for tool-calling/agent use in Open WebUI, not specifically for translation quality — benchmark against a commercial model early rather than assuming it's sufficient. |
-| TTS | Not deployed | No service running yet. Recommend XTTS-v2 (voice cloning, multilingual) as primary, following the same docker-compose + GPU passthrough pattern as `speaches`/`open-webui`. VRAM contention with ASR/LLM is not a concern — pipeline steps run sequentially, never concurrently. |
-| ffmpeg | Present (laptop) | Verify the build includes the `atempo` filter and can mux multi-audio-track + soft-subtitle MKV. |
-| Video acquisition | Out of scope | Video files are supplied externally; the pipeline does not download anything. |
-
-## Job directory & caching
-
-Each job is keyed by a `video_id` — a slug derived from the input filename by default, overridable with `--id`.
-
-```
-jobs/<video_id>/
-  meta.json                                  # title, duration, source filename
-  source.mp4                                 # as provided
-  audio.wav                                  # 16kHz mono, extracted for ASR
-  transcript.<asr_model>.json                # segments + timestamps
-  translation.<lang>.<model>.json            # translated segments, same structure
-  subtitles.<lang>.<model>.srt
-  tts_segments.<lang>.<tts_model>.<voice>/   # per-segment clips
-  tts_track.<lang>.<tts_model>.<voice>.wav   # assembled track
-  output.<lang>.mkv
-```
-
-Filenames encode the backend/model that produced them. Re-running a step with a different model adds a new file; it never overwrites the previous version.
+- `docs/steps/init.md`
+- `docs/steps/transcribe.md`
+- `docs/steps/translate.md`
+- `docs/steps/subtitles.md`
+- `docs/steps/tts.md`
+- `docs/steps/mux.md`
+- `docs/steps/run.md`
 
 ## Pipeline steps
 
-### 1. `init`
+Main execution order:
 
-Registers a job from a local video file: derives/accepts `video_id`, extracts metadata via `ffprobe`, extracts `audio.wav` via `ffmpeg` (16kHz mono). No network calls.
+```text
+init → transcribe → translate → subtitles → tts → mux
+```
 
-### 2. `transcribe` (ASR)
+`run` is an orchestration command that executes these steps in sequence and skips artifacts that already exist.
 
-Calls the ASR backend for word- or segment-level timestamps. Word-level (e.g. whisperX on top of faster-whisper) is preferable when available and enables diarization for multi-speaker videos. If official, non-auto-generated captions exist for a source, they can substitute for ASR — optional, not in v1.
+`run` must not implement the internal logic of individual steps. It only determines execution order, passes shared parameters, invokes steps in the correct sequence, and respects idempotency/`--force`.
 
-### 3. `translate` (LLM)
+Step roles in brief:
 
-The step most directly tied to the project's motivation.
+| Step | Purpose |
+|---|---|
+| `init` | Registers a job, creates the job directory, writes the job manifest and glossary, and prepares initial local artifacts. |
+| `transcribe` | Produces a transcript and timestamps through an ASR backend. |
+| `translate` | Translates the transcript through an LLM backend while applying glossary rules. |
+| `subtitles` | Creates a subtitle file from translated segments. |
+| `tts` | Creates a dubbed audio track through a TTS backend. |
+| `mux` | Builds the final video container from the source video, subtitles, and audio tracks. |
+| `run` | Runs the full pipeline end-to-end. |
 
-- **Glossary.** A plain list of terms to leave untranslated, one per line (`#` comments allowed) — no YAML wrapper needed for a flat list:
-  ```
-  loss
-  inference
-  distribution
-  gradient
-  embedding
-  batch
-  epoch
-  overfitting
-  ```
-  The system prompt combines this explicit list with a general instruction to preserve established English loanwords used by Russian-speaking practitioners. Neither alone is sufficient: the instruction without a list is inconsistent; the list without the instruction doesn't generalize to terms not yet added.
-- **Context and alignment.** Segments are translated in numbered batches, not in isolation — isolated segment translation loses context. The model returns a same-length JSON array (structured output where the backend supports it) so timestamp alignment is preserved. Long videos that exceed context are chunked with overlap between batches.
+## CLI layout
 
-### 4. `subtitles`
+All CLI wiring lives in `src/glam/cli.py`: the root command group, every subcommand, and each subcommand's arguments and options. `click` is used only here — step modules must not import `click` or any other CLI framework.
 
-Converts translated segments into `.srt`. Russian translations typically run longer than the English source, so original timings can't be copied 1:1 — segments need re-splitting/re-timing against reading-speed constraints (~17–20 chars/sec, ≤2 lines, ~42 chars/line). `pysubs2` handles the file format; resegmentation logic is custom.
+Each subcommand is a thin layer:
 
-### 5. `tts`
+- its flags and options are declared in `cli.py`. Click must know a command's options before it parses the arguments, so they cannot come from a module that is imported lazily;
+- its body imports the corresponding step module lazily, inside the function, and delegates the actual work to that module;
+- reading the config, formatting output, and error handling stay in `cli.py`.
 
-Second most complex step after translation.
+```python
+@main.command("init")
+@click.argument("video_file", ...)
+@config_option
+@handle_glam_errors
+def init_cmd(video_file, config_path, ...):
+    from glam.steps import init as init_step   # imported only when `init` runs
+    config = read_config(config_path)
+    job = init_step.run(..., echo=click.echo)
+    click.echo(...)
+```
 
-- **Backend options.** Local: XTTS-v2 (voice cloning, multilingual — primary recommendation now that VRAM contention isn't a concern) or Silero (lighter, CPU-friendly). Commercial: ElevenLabs, OpenAI TTS, Yandex SpeechKit (strong Russian support, but a Russian cloud provider — evaluate independently).
-- **Duration sync.** Generated speech must roughly fit each segment's original duration, or the dubbed track drifts from the video over a long clip. Coarse fit via the TTS engine's rate parameter (if supported); fine correction via `ffmpeg atempo` (or `rubberband`) within roughly ±20–30% — beyond that it sounds unnatural, at which point either accept drift or split the line. **Fidelity level not finalized** — see Open questions.
-- Cache both per-segment clips (so a single segment can be regenerated without redoing the whole track) and the assembled track.
+Because the step module is imported inside the command body, running one command imports only that step and its dependencies — not every step. This keeps `glam --help`, `glam version`, and any single command from pulling in unrelated backends (for example the OpenAI SDK used by remote steps).
 
-### 6. `mux`
+Step modules expose plain, CLI-agnostic functions — for example `run(...)` taking an `echo` callable that defaults to `print`. Step logic stays free of the CLI framework and easy to test in isolation.
 
-Combines source video + original audio + dubbed audio (separate tracks) + soft subtitles into one MKV. Current default recommendation: keep all tracks, switchable in the player, rather than committing to one variant. Hardsub (`-vf subtitles=...`) only for platforms that don't support soft subtitle tracks. **Not finalized** — see Open questions.
+Shared CLI helpers — the `--config` option and the `GlamError`-to-CLI error handler — live in `cli.py` and are applied to each command as decorators.
 
-## Configuration
+## Shared step parameters
 
-Config and glossary files live under `conf/`: `conf/config.example.yaml` is the portable, committed template; `conf/config.local.yaml` holds real deployment values and is gitignored (along with any other `*.local.*` file).
+All steps should rely on two shared concepts:
+
+### Config file
+
+Configuration is loaded from a config file.
+
+Default path:
+
+```text
+~/.glam.yaml
+```
+
+The CLI may allow overriding the config file path explicitly, for example with `--config` / `-c`.
+
+If the config file path is passed explicitly through the CLI, it takes precedence over the default path.
+The default path is used only when no explicit path is provided.
+
+### Job ID
+
+`job-id` identifies a specific video processing job and links all pipeline artifacts together.
+
+All steps after `init` should operate on an existing `job-id` and look for input/output files inside the corresponding job directory.
+
+### Job manifest
+
+Each job directory contains a `job.yaml` manifest created by `init`.
+
+`job.yaml` is the source of truth for metadata and run-level parameters that belong to this specific video job.
+
+Minimal structure:
 
 ```yaml
-# conf/config.local.yaml
-target_lang: ru
-source_lang: en
+version: 1
 
-steps:
-  asr:
-    backend: openai_compatible
-    base_url: http://<inference-host>:8000/v1
-    model: Systran/faster-whisper-large-v3
-    api_key_env: LOCAL_API_KEY
-  translate:
-    backend: openai_compatible
-    base_url: http://<inference-host>:11434/v1
-    model: qwen2.5:7b
-    api_key_env: LOCAL_API_KEY
-    glossary: ./conf/glossary.local.txt
-  tts:
-    backend: openai_compatible
-    base_url: http://<inference-host>:PORT/v1     # TBD once the TTS service is deployed
-    model: xtts-v2
-    voice: default
-    api_key_env: LOCAL_API_KEY
+job:
+  id: example-video
+  created_at: "2026-07-05T12:34:56+03:00"
 
-mux:
-  keep_original_audio: true
-  hardsub: false
+source:
+  original_path: "/original/path/video.mp4"
+  filename: "video.mp4"
+  artifact: "source.mp4"
+  audio_artifact: "audio.wav"
+  duration_seconds: 123.45
+
+languages:
+  source: en
+  target: ru
+
+# optional default TTS voice; omitted (null) when not set at init
+voice: nova
 ```
 
-Per-step override for a commercial backend, e.g. translation via GPT-4o:
+`languages.source` and `languages.target` are job-level parameters. They are provided during `init` and are later reused by downstream steps.
+
+`languages.target` is the job's default target language. The `translate`, `subtitles`, and `tts` steps accept `--target` to override it per run and write per-language artifacts (for example `translation.ru.json`, `subtitles.ru.srt`, `tts.ru.wav`), so one job can hold outputs for several languages. `voice` is the job's default TTS voice, which `tts` may override with `--voice`.
+
+### Job glossary
+
+Each job may contain a job-local glossary artifact:
+
+```text
+glossary.json
+```
+
+The glossary is stored as JSON because glossary keys may be full phrases or sentences.
+
+When a glossary path is passed to `init`, the file is copied into the job directory as `glossary.json`. Downstream steps must read only the job-local `glossary.json`, not the original external path.
+
+This allows the glossary to be edited for a single video without mutating a shared glossary file.
+
+## Data flow between steps
+
+Pipeline steps must not call each other directly.
+
+Each step:
+
+- reads input artifacts from the job directory;
+- reads job metadata and job-level parameters from `job.yaml`;
+- creates its own output artifacts in the job directory;
+- does not keep pipeline state in memory between commands.
+
+This allows steps to be run independently, an individual step to be repeated, the backend/config to be changed, and `run` to remain only an orchestration layer.
+
+## Artifact names
+
+Output artifact names should be deterministic and built from parameters that affect the result.
+
+Usually this includes:
+
+- `job-id`, through placement inside the job directory;
+- the step name;
+- the target language, when applicable;
+- backend/model/voice/config variant, when it affects the result.
+
+This is required for caching, reproducibility, and comparing results from different backend/model choices.
+
+## Idempotency and `--force`
+
+Each pipeline step must be idempotent.
+
+If a step's output artifact already exists, the step must not recompute it.
+
+`--force` explicitly allows recreating the output of the current step.
+
+General rule:
+
+```text
+output exists + no --force → skip
+output missing → run
+output exists + --force → recompute
+```
+
+A step must not accidentally overwrite artifacts created by another backend/model/config variant. If different backends/models produce different results, this must be reflected in the artifact name or location.
+
+## Local and remote steps
+
+Part of the pipeline runs locally, where the CLI is invoked.
+
+Local steps:
+
+- `init`
+- `subtitles`
+- `mux`
+- `run` as an orchestration layer
+
+Local steps may use the filesystem, CPU, and local utilities such as `ffmpeg`, but they must not require a model backend.
+
+Remote model-backed steps:
+
+- `transcribe`
+- `translate`
+- `tts`
+
+Remote steps must not assume a local GPU or a locally installed model runtime. They call an external service over HTTP.
+
+## Service protocols
+
+Every remote model-backed service declares a `protocol` in its config entry. The protocol selects how the service is called and which additional config fields that entry carries.
+
+- `openai` — the OpenAI-compatible protocol. It is the common choice and works for any OpenAI-compatible backend: ASR in `transcribe`, LLM in `translate`, TTS in `tts`.
+- `chatterbox` and other named protocols — native protocols for a specific server, used when it exposes capabilities the OpenAI request shape cannot express. For `tts`, Chatterbox's native `/tts` endpoint adds per-request `language` selection and voice cloning. Each native protocol must be documented in the owning step's doc.
+
+Pipeline steps must not hard-code a provider or protocol. Selecting or replacing a backend is a configuration change (`protocol`, `url`, and protocol-specific fields), not a change to a step's business logic. Because the request shape and available fields depend on the protocol, a service entry's config schema depends on its `protocol` (see "Configuration structure").
+
+## Backends
+
+Remote steps call their model backend through a small per-step backend abstraction instead of building a client inline. The abstraction lives in the `glam.backend` package, one subpackage per step that has a remote backend:
+
+```text
+src/glam/backend/
+  tts/         base interface + one module per protocol (openai, chatterbox, ...)
+  transcribe/  base interface + openai
+  translate/   base interface + openai
+```
+
+Each subpackage's `base.py` defines the step's backend interface (for example `TtsBackend.synthesize(...)`) and a factory that dispatches on the service `protocol`, lazily importing only the selected implementation so choosing one backend never imports another backend's SDK. Implementation modules (`openai.py`, `chatterbox.py`, ...) hold the protocol client and parse their own protocol-specific config from the service entry.
+
+`glam.common` stays free of these clients and their heavy SDK imports: it parses only the common part of a service entry (`name`, `protocol`, `url`) and hands the rest to the backend, which validates the protocol-specific fields when the step builds it.
+
+## Errors
+
+Expected failures should be converted into clear CLI errors.
+
+Examples of expected failures:
+
+- missing config file;
+- unknown `job-id`;
+- missing input artifact from a previous step;
+- multiple matching input/output artifacts found and the choice is ambiguous;
+- remote service is unavailable;
+- remote service returned a response with an invalid format.
+
+Such errors should use the base error class from `glam.common.errors`.
+
+## Shared code in `glam.common`
+
+`glam.common` is the package of code shared by all pipeline steps. Its `__init__.py` stays empty; each shared concern lives in its own submodule:
+
+- `common/errors.py` — the base error class for the project (`GlamError`);
+- `common/config.py` — `dataclass Config`, its service definitions, and `read_config`, the function for reading the config file;
+- `common/job.py` — the job manifest (`job.yaml`) dataclasses and its read/write helpers;
+- `common/translation.py` — reading and validating the `translation.<target>.json` artifact shared by `subtitles` and `tts`.
+
+The client for a remote service lives in that service's backend module under `glam.backend` (see "Backends"), not in `glam.common`: `glam.common` is imported by every step, including local ones, and must not pull in a heavy SDK import such as the OpenAI SDK.
+
+Step-specific logic must not grow inside `glam.common`. Details of a specific step should stay in that step's module.
+
+Types and classes used only in one module must be declared in that module. Only move a type or class into a shared module when at least two modules use it.
+
+## Configuration structure
+
+The config file should contain shared pipeline settings and service definitions.
+
+Minimal structure:
 
 ```yaml
-# conf/config.translate-gpt4o.yaml — inherits everything else, overrides translate only
-steps:
-  translate:
-    backend: openai_compatible
-    base_url: https://api.openai.com/v1
-    model: gpt-4o
-    api_key_env: OPENAI_API_KEY
+job_dir: ./jobs
+
+defaults:
+  source: en
+  target: ru
+
+services:
+  - name: transcribe
+    protocol: openai
+    url: http://host:8000/v1
+    params:
+      model: some-asr-model
+
+  - name: translate
+    protocol: openai
+    url: http://host:11434/v1
+    params:
+      model: some-llm-model
+      api_key: SECRET
+
+  - name: tts
+    protocol: chatterbox
+    url: http://host:8004
 ```
 
-## CLI
+### `job_dir`
 
-```
-glam init <video_file> [--id ID]
-glam transcribe <video_id> [-c conf/config.local.yaml]
-glam translate <video_id> --lang ru [-c conf/config.local.yaml]
-glam subtitles <video_id> --lang ru
-glam tts <video_id> --lang ru [-c conf/config.local.yaml]
-glam mux <video_id> --lang ru [--hardsub]
-glam run <video_file> --lang ru [-c conf/config.local.yaml]   # full pipeline, skipping cached steps
-```
+`job_dir` defines the base directory where job directories and pipeline artifacts are stored.
 
-## Orchestration
+### `defaults`
 
-Steps are file-based and don't call each other directly, so any orchestration layer works on top. Current default: a thin `run` command that calls each step in order and checks for an existing output file. A Makefile fits the same caching model naturally (mtime-based) without adding a dependency; Snakemake would add an explicit DAG and parallelism at the cost of a framework layer this project's size probably doesn't need. **Not finalized** — see Open questions.
+`defaults` is an optional section holding job-level defaults. Currently it carries the default languages:
 
-## Open questions
+- `source` — default source language, used by `init` when `--source` is omitted;
+- `target` — default target language, used by `init` when `--target` is omitted.
 
-- **TTS duration-sync fidelity.** Full rate/`atempo`-based sync (described above) vs. accepting drift and concatenating sequentially for v1. Significantly affects step 5 complexity.
-- **Final output format.** Multi-track MKV (original + dubbed audio, soft subtitles) vs. a single file with the translation baked in. Multi-track is the current default recommendation, not yet confirmed.
-- **Orchestration tool.** Simple `run` command (current default) vs. Makefile vs. Snakemake.
+Both are optional. A per-run `--source`/`--target` flag always overrides the default, and if neither the flag nor the default is set, `init` reports a clear error. Job-level parameters (like the languages) are still recorded per job in `job.yaml`; `defaults` only seeds them at `init` time.
 
-## Roadmap
+### `services`
 
-1. Skeleton: repo structure, job directories, config schema, CLI stubs.
-2. ASR: wire up to `speaches`, cache, JSON with timestamps.
-3. Translation: prompt + glossary, local model, index-preserving batching; commercial-backend adapter for comparison.
-4. Subtitles: segments → SRT, validate line length/reading speed against a real video.
-5. TTS: deploy the service on the inference host, integrate, duration sync, track assembly.
-6. Mux: ffmpeg, MKV with soft subtitles + two audio tracks.
-7. Orchestration polish: `run` for full runs, `--force`, local/commercial config profiles.
-8. Later: playlists/batch processing, voice cloning, vocal/background separation (Demucs) to preserve music under dubbed speech.
+`services` describes remote model-backed services.
 
-## Immediate infrastructure TODO
+Every entry has three **required** common fields plus one optional protocol-specific bag:
 
-- [ ] Deploy a TTS service on the inference host (docker-compose, GPU passthrough, `/etc/localtime` volume-mount for TZ — same pattern as the ASR service).
-- [ ] Confirm the LLM backend's OpenAI-compatible endpoint responds as expected.
-- [ ] Confirm the inference host is network-reachable (hostname or fixed IP) from wherever the pipeline runs.
-- [ ] `pip install pysubs2` on the runner machine.
-- [ ] Confirm the runner's `ffmpeg` build has `atempo` and can produce multi-audio-track + soft-sub MKV.
+- `name` — the step or service name, for example `transcribe`, `translate`, `tts`;
+- `protocol` — selects how the service is called (`openai`, `chatterbox`, ...) and therefore which fields `params` carries;
+- `url` — base URL of the service;
+- `params` — an optional mapping (default `{}`) of protocol-specific fields.
+
+The shared config loader validates only the common part and keeps `params` as a plain mapping. Each backend deserializes `params` into its own typed config and validates it when the step builds the backend — so the schema of `params` depends on `protocol`:
+
+- `openai` — `params.model` (model name); `params.api_key` (optional API key; real keys belong only in local, uncommitted config files); for `tts`, an optional default `params.voice` (the OpenAI speech protocol requires a voice, so this or a per-run `--voice` must be set). The `url` points at the OpenAI-compatible base (usually ending in `/v1`).
+- `chatterbox` (`tts` only) — the `url` points at the server root; the native `/tts` endpoint is appended by the backend. `params` may be empty; the server requires a predefined voice, so when none is resolved the backend falls back to a built-in default voice.
+
+Step-specific tuning does not belong to the config file; it lives in CLI options, job-local files such as `job.yaml` and `glossary.json`, and constants of the corresponding step module.
+
+Source language, target language, and glossary path are not global config values. They are parameters of a specific job and are passed to `init` with `--source`, `--target`, and `--glossary`.

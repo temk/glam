@@ -1,18 +1,45 @@
-import ffmpeg
+import json
+import subprocess
 
-from glam.errors import GlamError
+from glam.common.errors import GlamError
 
 
 class MediaError(GlamError):
     pass
 
 
-def ffprobe_json(path):
+def run_ffmpeg(args, error_prefix, error_cls=MediaError):
+    """Run `ffmpeg -y <args>`, raising error_cls with stderr on failure."""
+    cmd = ["ffmpeg", "-y", *[str(a) for a in args]]
     try:
-        return ffmpeg.probe(str(path))
-    except ffmpeg.Error as e:
-        stderr = e.stderr.decode(errors="replace") if e.stderr else str(e)
-        raise MediaError(f"ffprobe failed on {path}: {stderr.strip()}") from e
+        result = subprocess.run(cmd, capture_output=True)
+    except OSError as e:
+        raise error_cls(f"{error_prefix}: {e}") from e
+    if result.returncode != 0:
+        stderr = result.stderr.decode(errors="replace").strip() if result.stderr else ""
+        raise error_cls(f"{error_prefix}: {stderr}")
+    return result
+
+
+def ffprobe_json(path):
+    cmd = [
+        "ffprobe",
+        "-v",
+        "error",
+        "-print_format",
+        "json",
+        "-show_format",
+        "-show_streams",
+        str(path),
+    ]
+    try:
+        result = subprocess.run(cmd, capture_output=True)
+    except OSError as e:
+        raise MediaError(f"ffprobe failed on {path}: {e}") from e
+    if result.returncode != 0:
+        stderr = result.stderr.decode(errors="replace").strip() if result.stderr else ""
+        raise MediaError(f"ffprobe failed on {path}: {stderr}")
+    return json.loads(result.stdout)
 
 
 def probe_duration(path):
@@ -20,14 +47,7 @@ def probe_duration(path):
 
 
 def extract_audio(src, dst, sample_rate=16000):
-    try:
-        (
-            ffmpeg
-            .input(str(src))
-            .audio
-            .output(str(dst), ac=1, ar=sample_rate)
-            .run(overwrite_output=True, quiet=True)
-        )
-    except ffmpeg.Error as e:
-        stderr = e.stderr.decode(errors="replace") if e.stderr else str(e)
-        raise MediaError(f"ffmpeg audio extraction failed on {src}: {stderr.strip()}") from e
+    run_ffmpeg(
+        ["-i", src, "-vn", "-ac", "1", "-ar", str(sample_rate), dst],
+        f"ffmpeg audio extraction failed on {src}",
+    )

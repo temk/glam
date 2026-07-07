@@ -1,6 +1,8 @@
 jobs/*
 !jobs/.gitkeep
 
+input/
+
 *.local.*
 
 __pycache__/

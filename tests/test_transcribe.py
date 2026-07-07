@@ -1,104 +1,159 @@
 import json
-from unittest.mock import MagicMock
-
+import openai
 import pytest
+from types import SimpleNamespace
+from pathlib import Path
 
-from glam.steps import transcribe
+from glam.steps import transcribe as transcribe_step
+from glam.common.job import JobInfo, Languages, SourceInfo, JobManifest, write_job_manifest
+from glam.common.config import Config, Protocol, ConfigError, ServiceName, ServiceConfig
+from glam.steps.transcribe import TranscribeError
+from glam.backend.transcribe.base import TranscribeBackendError
 
-
-class FakeTranscription:
-    def __init__(self, data):
-        self._data = data
-
-    def model_dump(self):
-        return self._data
-
-
-def make_config(model="fake-model", **overrides):
-    asr = {
-        "backend": "openai_compatible",
-        "base_url": "http://fake-host:8000/v1",
-        "model": model,
-    }
-    asr.update(overrides)
-    return {"steps": {"asr": asr}}
+DEFAULT_SEGMENTS = [
+    {"id": 0, "start": 0.0, "end": 1.5, "text": "Hello."},
+    {"id": 1, "start": 1.5, "end": 3.0, "text": "World."},
+]
 
 
-def make_job(tmp_path, video_id="myvid"):
-    job_dir = tmp_path / "jobs" / video_id
-    job_dir.mkdir(parents=True)
-    (job_dir / "audio.wav").write_bytes(b"fake audio bytes")
-    return job_dir
-
-
-def test_transcribe_writes_segments(tmp_path, monkeypatch):
-    job_dir = make_job(tmp_path)
-    fake_response = FakeTranscription({
-        "text": "hello world",
-        "language": "en",
-        "duration": 1.2,
-        "segments": [{"id": 0, "start": 0.0, "end": 1.2, "text": "hello world"}],
-        "words": [
-            {"word": "hello", "start": 0.0, "end": 0.5},
-            {"word": "world", "start": 0.6, "end": 1.2},
-        ],
-    })
-    fake_client = MagicMock()
-    fake_client.audio.transcriptions.create.return_value = fake_response
-    monkeypatch.setattr(transcribe, "build_openai_client", lambda cfg: fake_client)
-
-    result_path = transcribe.run(
-        "myvid", make_config(), jobs_root=tmp_path / "jobs", echo=lambda *_: None
+def _make_job(tmp_path: Path, job_id: str = "jobA", source: str = "en", with_audio: bool = True) -> Path:
+    job_path = tmp_path / job_id
+    job_path.mkdir(parents=True)
+    manifest = JobManifest(
+        version=1,
+        job=JobInfo(id=job_id, created_at="2026-07-05T00:00:00+00:00"),
+        source=SourceInfo(
+            original_path="/x/video.mp4",
+            filename="video.mp4",
+            artifact="source.mp4",
+            audio_artifact="audio.wav",
+            duration_seconds=3.0,
+        ),
+        languages=Languages(source=source, target="ru"),
     )
-
-    assert result_path == job_dir / "transcript.fake-model.json"
-    data = json.loads(result_path.read_text())
-    assert data["model"] == "fake-model"
-    assert data["segments"][0]["text"] == "hello world"
-    assert len(data["words"]) == 2
-
-    _, kwargs = fake_client.audio.transcriptions.create.call_args
-    assert kwargs["model"] == "fake-model"
-    assert kwargs["response_format"] == "verbose_json"
-    assert kwargs["timestamp_granularities"] == ["segment", "word"]
+    write_job_manifest(manifest, job_path / "job.yaml")
+    if with_audio:
+        (job_path / "audio.wav").write_bytes(b"fake-wav")
+    return job_path
 
 
-def test_transcribe_missing_audio_raises(tmp_path):
-    with pytest.raises(transcribe.TranscribeError):
-        transcribe.run(
-            "missing", make_config(), jobs_root=tmp_path / "jobs", echo=lambda *_: None
+def _config(tmp_path: Path, with_service: bool = True, model: str = "whisper-x") -> Config:
+    services = []
+    if with_service:
+        services.append(
+            ServiceConfig(
+                name=ServiceName.TRANSCRIBE, protocol=Protocol.OPENAI, url="http://asr/v1", params={"model": model}
+            )
         )
+    return Config(services=services, job_dir=tmp_path)
 
 
-def test_transcribe_is_idempotent_unless_forced(tmp_path, monkeypatch):
-    job_dir = make_job(tmp_path)
-    transcript_path = job_dir / "transcript.fake-model.json"
-    transcript_path.write_text('{"already": "there"}')
+def _fake_client(calls, segments=DEFAULT_SEGMENTS, error=None):
+    response = SimpleNamespace(segments=None if segments is None else [SimpleNamespace(**s) for s in segments])
 
-    fake_client = MagicMock()
-    monkeypatch.setattr(transcribe, "build_openai_client", lambda cfg: fake_client)
+    def create(**kwargs):
+        calls.append(kwargs)
+        if error is not None:
+            raise error
+        return response
 
-    result_path = transcribe.run(
-        "myvid", make_config(), jobs_root=tmp_path / "jobs", echo=lambda *_: None
-    )
-
-    assert result_path == transcript_path
-    fake_client.audio.transcriptions.create.assert_not_called()
+    return SimpleNamespace(audio=SimpleNamespace(transcriptions=SimpleNamespace(create=create)))
 
 
-def test_transcribe_force_recomputes(tmp_path, monkeypatch):
-    job_dir = make_job(tmp_path)
-    transcript_path = job_dir / "transcript.fake-model.json"
-    transcript_path.write_text('{"already": "there"}')
+@pytest.fixture
+def patch_client(monkeypatch):
+    """Replace the ASR client factory; return a recorder for the requests it receives."""
 
-    fake_response = FakeTranscription({"segments": []})
-    fake_client = MagicMock()
-    fake_client.audio.transcriptions.create.return_value = fake_response
-    monkeypatch.setattr(transcribe, "build_openai_client", lambda cfg: fake_client)
+    def install(segments=DEFAULT_SEGMENTS, error=None):
+        calls: list[dict] = []
+        client = _fake_client(calls, segments=segments, error=error)
+        monkeypatch.setattr("openai.OpenAI", lambda **kwargs: client)
+        return calls
 
-    transcribe.run(
-        "myvid", make_config(), jobs_root=tmp_path / "jobs", force=True, echo=lambda *_: None
-    )
+    return install
 
-    fake_client.audio.transcriptions.create.assert_called_once()
-    assert json.loads(transcript_path.read_text())["segments"] == []
+
+def test_creates_transcript(tmp_path, patch_client):
+    patch_client()
+    _make_job(tmp_path)
+    path = transcribe_step.run("jobA", _config(tmp_path), echo=lambda *_: None)
+
+    data = json.loads(path.read_text())
+    assert path.name == "transcript.json"
+    assert data["version"] == 1
+    assert data["step"] == "transcribe"
+    assert data["job_id"] == "jobA"
+    assert data["source_language"] == "en"
+    assert data["model"] == "whisper-x"
+    assert data["audio_artifact"] == "audio.wav"
+    assert data["segments"] == DEFAULT_SEGMENTS
+
+
+def test_requests_verbose_segments_in_source_language(tmp_path, patch_client):
+    calls = patch_client()
+    _make_job(tmp_path, source="de")
+    transcribe_step.run("jobA", _config(tmp_path, model="whisper-x"), echo=lambda *_: None)
+
+    assert len(calls) == 1
+    req = calls[0]
+    assert req["model"] == "whisper-x"
+    assert req["language"] == "de"
+    assert req["response_format"] == "verbose_json"
+    assert req["timestamp_granularities"] == ["segment"]
+
+
+def test_skips_when_transcript_exists(tmp_path, patch_client):
+    calls = patch_client()
+    job_path = _make_job(tmp_path)
+    (job_path / "transcript.json").write_text('{"existing": true}')
+
+    transcribe_step.run("jobA", _config(tmp_path), echo=lambda *_: None)
+
+    assert calls == []  # ASR was not called
+    assert json.loads((job_path / "transcript.json").read_text()) == {"existing": True}
+
+
+def test_force_recreates(tmp_path, patch_client):
+    calls = patch_client()
+    job_path = _make_job(tmp_path)
+    (job_path / "transcript.json").write_text('{"existing": true}')
+
+    transcribe_step.run("jobA", _config(tmp_path), force=True, echo=lambda *_: None)
+
+    assert len(calls) == 1
+    assert json.loads((job_path / "transcript.json").read_text())["step"] == "transcribe"
+
+
+def test_job_not_found(tmp_path, patch_client):
+    patch_client()
+    with pytest.raises(TranscribeError):
+        transcribe_step.run("missing", _config(tmp_path), echo=lambda *_: None)
+
+
+def test_missing_audio(tmp_path, patch_client):
+    patch_client()
+    _make_job(tmp_path, with_audio=False)
+    with pytest.raises(TranscribeError):
+        transcribe_step.run("jobA", _config(tmp_path), echo=lambda *_: None)
+
+
+def test_missing_service_in_config(tmp_path, patch_client):
+    patch_client()
+    _make_job(tmp_path)
+    with pytest.raises(ConfigError):
+        transcribe_step.run("jobA", _config(tmp_path, with_service=False), echo=lambda *_: None)
+
+
+@pytest.mark.parametrize("segments", [[], None])
+def test_response_without_segments_raises(tmp_path, patch_client, segments):
+    patch_client(segments=segments)
+    _make_job(tmp_path)
+    with pytest.raises(TranscribeBackendError):
+        transcribe_step.run("jobA", _config(tmp_path), echo=lambda *_: None)
+
+
+def test_service_unavailable_raises(tmp_path, patch_client):
+    patch_client(error=openai.OpenAIError("connection refused"))
+    _make_job(tmp_path)
+    with pytest.raises(TranscribeBackendError):
+        transcribe_step.run("jobA", _config(tmp_path), echo=lambda *_: None)

@@ -1,51 +1,59 @@
 import json
 from pathlib import Path
+from dataclasses import asdict, dataclass
 
-import openai
+from glam.common.job import JOB_MANIFEST_NAME, read_job_manifest
+from glam.common.config import Config, ServiceName
+from glam.common.errors import GlamError
+from glam.backend.transcribe.base import AsrSegment, build_transcribe_backend
 
-from glam.clients import build_openai_client
-from glam.config import step_config
-from glam.errors import GlamError
-from glam.paths import job_dir, slugify
+TRANSCRIPT_NAME = "transcript.json"
+TRANSCRIPT_VERSION = 1
 
 
 class TranscribeError(GlamError):
     pass
 
 
-def run(video_id, config, jobs_root=Path("jobs"), force=False, echo=print):
-    job_path = job_dir(jobs_root, video_id)
-    audio_path = job_path / "audio.wav"
+@dataclass
+class Transcript:
+    version: int
+    step: str
+    job_id: str
+    source_language: str
+    model: str
+    audio_artifact: str
+    segments: list[AsrSegment]
+
+
+def run(job_id: str, config: Config, force: bool = False, echo=print) -> Path:
+    """Transcribe a job's audio through the configured ASR service into `transcript.json`."""
+    job_path = config.job_dir / job_id
+    if not job_path.is_dir():
+        raise TranscribeError(f"job not found: {job_id} (looked in {job_path})")
+
+    manifest = read_job_manifest(job_path / JOB_MANIFEST_NAME)
+    audio_path = job_path / manifest.source.audio_artifact
     if not audio_path.exists():
-        raise TranscribeError(f"{audio_path} not found — run 'glam init' for this job first")
+        raise TranscribeError(f"missing audio artifact: {audio_path}")
 
-    asr_cfg = step_config(config, "asr")
-    model = asr_cfg["model"]
-    granularities = asr_cfg.get("timestamp_granularities", ["segment", "word"])
-
-    transcript_path = job_path / f"transcript.{slugify(model)}.json"
+    transcript_path = job_path / TRANSCRIPT_NAME
     if transcript_path.exists() and not force:
-        echo(f"skip transcription, already exists: {transcript_path}")
+        echo(f"skip transcript, already exists: {transcript_path}")
         return transcript_path
 
-    client = build_openai_client(asr_cfg)
-    try:
-        with audio_path.open("rb") as f:
-            response = client.audio.transcriptions.create(
-                model=model,
-                file=f,
-                response_format="verbose_json",
-                timestamp_granularities=granularities,
-            )
-    except openai.OpenAIError as e:
-        raise TranscribeError(
-            f"ASR request to {asr_cfg.get('base_url')} failed: {e}. "
-            "Verify the backend is reachable and speaks the OpenAI-compatible "
-            "/v1/audio/transcriptions shape before assuming this is a code bug."
-        ) from e
+    backend = build_transcribe_backend(config[ServiceName.TRANSCRIBE])
+    segments = backend.transcribe(audio_path, manifest.languages.source)
 
-    data = response.model_dump()
-    data["model"] = model
-    transcript_path.write_text(json.dumps(data, indent=2, ensure_ascii=False))
-    echo(f"wrote {transcript_path}")
+    transcript = Transcript(
+        version=TRANSCRIPT_VERSION,
+        step="transcribe",
+        job_id=job_id,
+        source_language=manifest.languages.source,
+        model=backend.model,
+        audio_artifact=manifest.source.audio_artifact,
+        segments=segments,
+    )
+    transcript_path.write_text(json.dumps(asdict(transcript), ensure_ascii=False, indent=2) + "\n")
+    echo(f"wrote {transcript_path} ({len(segments)} segments)")
     return transcript_path
