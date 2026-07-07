@@ -8,7 +8,7 @@ The step is **optional** and **language-specific**. It only produces output for 
 registered fixer; for any other target language it does nothing.
 
 This step runs **locally**. For Russian it loads a bundled stress-prediction model
-(`ruaccent-predictor`) on the machine running the CLI; it makes no network calls and uses no service
+(`silero-stress`) on the machine running the CLI; it makes no network calls and uses no service
 from the config.
 
 ## Purpose
@@ -64,9 +64,11 @@ For a language without a fixer, the step writes nothing.
 The step keeps a registry mapping a target language to its text fixer. A language absent from the
 registry is left untouched (no output).
 
-- `ru` — Russian stress marks. Each segment is run through `ruaccent-predictor`. The stressed vowel
-  is marked with the combining acute accent (`U+0301`), for example `Наде́юсь`, which is the stress
-  form TTS engines expect.
+- `ru` — Russian stress marks. Each segment is run through `silero-stress`, which also handles
+  homograph disambiguation and `ё` restoration. Monosyllables are left unmarked
+  (`stress_single_vowel=False`), since their stress is unambiguous. Silero writes `+` before each
+  stressed vowel; the step moves that mark onto the vowel as the combining acute accent (`U+0301`),
+  for example `зов+ут` → `зову́т`, which is the stress form TTS engines expect.
 
 Adding support for another language means registering a fixer for it; no other step changes.
 

@@ -143,7 +143,8 @@ terms never drift.
   and `tts` picks that up automatically (subtitles keep using the plain translation). You can
   hand-edit the `.fixed.json` to correct any misplaced stress before dubbing.
 - Choose a dubbing voice with `--voice` on `init` (stored with the job) or on `tts`. Omit it
-  to use the server's default voice.
+  to use the server's default voice. Give the voice name without a file extension (e.g. `Michael`);
+  the chatterbox backend appends `.wav` when it builds the server's voice id.
 - `mux` picks up every `tts.*.wav` and `subtitles.*.srt` in the job and adds them all as
   labeled tracks; use `--exclude <artifact>` to leave one out.
 

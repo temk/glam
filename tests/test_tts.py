@@ -333,18 +333,18 @@ def test_chatterbox_uses_default_voice_when_unset(tmp_path, patch_chatterbox):
     path = tts_step.run("jobA", _chatterbox_config(tmp_path), echo=lambda *_: None)
 
     # The server requires a predefined voice, so the backend falls back to its built-in default;
-    # a fallback default does not enter the artifact name.
+    # a fallback default does not enter the artifact name. The backend appends `.wav` to the id.
     assert path.name == "tts.ru.wav"
-    assert all(c["json"]["predefined_voice_id"] == CHATTERBOX_DEFAULT_VOICE for c in calls)
+    assert all(c["json"]["predefined_voice_id"] == CHATTERBOX_DEFAULT_VOICE + ".wav" for c in calls)
 
 
 def test_chatterbox_sends_voice_when_set(tmp_path, patch_chatterbox):
     calls = patch_chatterbox()
-    _make_job(tmp_path, voice="female_01")  # voice from job.yaml
+    _make_job(tmp_path, voice="Michael")  # voice from job.yaml, without extension
     path = tts_step.run("jobA", _chatterbox_config(tmp_path), echo=lambda *_: None)
 
-    assert path.name == "tts.ru.female_01.wav"
-    assert all(c["json"]["predefined_voice_id"] == "female_01" for c in calls)
+    assert path.name == "tts.ru.Michael.wav"  # voice enters the name as-is
+    assert all(c["json"]["predefined_voice_id"] == "Michael.wav" for c in calls)  # backend appends .wav
 
 
 def test_chatterbox_backend_unavailable(tmp_path, patch_chatterbox):

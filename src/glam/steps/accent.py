@@ -1,3 +1,4 @@
+import re
 import json
 from pathlib import Path
 from collections.abc import Callable
@@ -9,6 +10,10 @@ from glam.common.translation import translation_filename, fixed_translation_file
 
 # Combining acute accent placed on the stressed vowel; this is the stress form TTS engines expect.
 STRESS_MARK = "́"
+
+# Silero marks the stressed vowel by writing `+` in front of it (`зов+ут`); this matches such a `+`
+# and the vowel that follows so we can move the mark onto the vowel as a combining accent.
+_STRESS_PLUS = re.compile(r"\+([аеёиоуыэюяАЕЁИОУЫЭЮЯ])")
 
 
 class AccentError(GlamError):
@@ -66,14 +71,20 @@ def _load_translation_doc(path: Path) -> dict:
 def _fix_russian_stress(texts: list[str]) -> list[str]:
     """Mark the stressed vowel in each Russian segment with a combining acute accent."""
     accentor = _load_ru_accentor()
-    # RUAccent's 'apostrophe' format writes a `'` after the stressed vowel; turn it into the
-    # combining acute accent so it sits on the vowel (`Над'еюсь` -> `Наде́юсь`).
-    return [text.replace("'", STRESS_MARK) for text in accentor.put_accent(texts, format="apostrophe")]
+    # Silero takes one sentence at a time and emits `+` before each stressed vowel; move the mark
+    # onto the vowel as a combining acute accent (`зов+ут` -> `зову́т`) that TTS engines understand.
+    # `stress_single_vowel=False` leaves monosyllables unmarked — their stress is unambiguous and
+    # marking every one just adds noise the TTS voice does not need.
+    return [_plus_to_combining(accentor(t, stress_single_vowel=False)) if t.strip() else t for t in texts]
+
+
+def _plus_to_combining(text: str) -> str:
+    return _STRESS_PLUS.sub(r"\1" + STRESS_MARK, text)
 
 
 def _load_ru_accentor():
     # Imported lazily: this pulls in torch and the accentor model, which no other step needs.
-    from ruaccent import load_accentor  # type: ignore[import-untyped]
+    from silero_stress import load_accentor  # type: ignore[import-untyped]
 
     return load_accentor()
 

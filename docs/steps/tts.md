@@ -34,6 +34,8 @@ The step module must remain independent of the CLI.
 `--voice` selects the voice, overriding the job's default `voice` from `job.yaml`. Voice resolution
 is: `--voice`, then the job's `voice`, otherwise it is left unset and the TTS backend picks its own
 default. When a voice is set by either `--voice` or `job.yaml`, it is included in the artifact name.
+Voices are configured without a file extension; the chatterbox backend appends `.wav` when it builds
+the server's `predefined_voice_id` (so voice `Michael` becomes id `Michael.wav`).
 
 ## Input data
 

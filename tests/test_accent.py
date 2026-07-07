@@ -4,7 +4,7 @@ from pathlib import Path
 
 from glam.steps import accent as accent_step
 from glam.common.job import JobInfo, Languages, SourceInfo, JobManifest, write_job_manifest
-from glam.steps.accent import STRESS_MARK, AccentError, _fix_russian_stress
+from glam.steps.accent import STRESS_MARK, AccentError, _plus_to_combining, _fix_russian_stress
 from glam.common.config import Config
 
 TRANSLATION = {
@@ -48,25 +48,22 @@ def _config(tmp_path: Path) -> Config:
 
 @pytest.fixture
 def fake_ru_accentor(monkeypatch):
-    """Replace the heavy ruaccent loader with a fake so tests never import torch."""
+    """Replace the heavy silero loader with a fake callable so tests never import torch."""
 
-    class FakeAccentor:
-        def put_accent(self, texts, format="apostrophe"):
-            # Emulate RUAccent's apostrophe format: mark the first vowel of each word.
-            return [self._mark(t) for t in texts]
-
-        @staticmethod
-        def _mark(text: str) -> str:
-            out, done = [], set()
-            for i, ch in enumerate(text):
-                word = text[:i].split()[-1] if text[:i].split() else ""
+    def accentor(sentence: str, **kwargs) -> str:
+        # Emulate silero: write `+` before the first vowel of each word.
+        out = []
+        for word in sentence.split(" "):
+            marked = False
+            for ch in word:
+                if not marked and ch.lower() in "аеёиоуыэюя":
+                    out.append("+")
+                    marked = True
                 out.append(ch)
-                if ch.lower() in "аеиоуыэюя" and word not in done:
-                    out.append("'")
-                    done.add(word)
-            return "".join(out)
+            out.append(" ")
+        return "".join(out).rstrip(" ")
 
-    monkeypatch.setattr(accent_step, "_load_ru_accentor", lambda: FakeAccentor())
+    monkeypatch.setattr(accent_step, "_load_ru_accentor", lambda: accentor)
 
 
 # --- run() ---
@@ -79,7 +76,7 @@ def test_writes_fixed_file_for_russian(tmp_path, fake_ru_accentor):
     assert path is not None and path.name == "translation.ru.fixed.json"
     doc = json.loads(path.read_text())
     assert STRESS_MARK in doc["segments"][0]["translated_text"]  # accent applied
-    assert "'" not in doc["segments"][0]["translated_text"]  # apostrophe converted, not left in
+    assert "+" not in doc["segments"][0]["translated_text"]  # silero's '+' converted, not left in
 
 
 def test_preserves_structure_and_source_text(tmp_path, fake_ru_accentor):
@@ -133,10 +130,24 @@ def test_job_not_found(tmp_path):
         accent_step.run("missing", _config(tmp_path), echo=lambda *_: None)
 
 
-# --- Russian fixer transform (accentor faked) ---
+# --- Russian fixer transform ---
 
 
-def test_fix_russian_converts_apostrophe_to_combining_accent(tmp_path, fake_ru_accentor):
-    out = _fix_russian_stress(["Привет"])
-    assert out[0] == "Приве́т" or STRESS_MARK in out[0]
-    assert "'" not in out[0]
+@pytest.mark.parametrize(
+    "raw, expected",
+    [
+        ("зов+ут", "зов" + "у" + STRESS_MARK + "т"),  # '+' before vowel -> combining accent after it
+        ("+я", "я" + STRESS_MARK),
+        ("Л+ёва", "Л" + "ё" + STRESS_MARK + "ва"),
+        ("без ударения", "без ударения"),  # no '+' -> unchanged
+    ],
+)
+def test_plus_to_combining(raw, expected):
+    assert _plus_to_combining(raw) == expected
+    assert "+" not in _plus_to_combining(raw)
+
+
+def test_fix_russian_marks_stress(fake_ru_accentor):
+    out = _fix_russian_stress(["Привет", ""])
+    assert STRESS_MARK in out[0] and "+" not in out[0]
+    assert out[1] == ""  # empty text is left untouched

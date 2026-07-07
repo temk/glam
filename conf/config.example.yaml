@@ -21,7 +21,8 @@ services:
 
   # Native Chatterbox-TTS-Server: `url` is the server root, the backend appends `/tts`.
   # The target language is sent per request; a built-in default voice is used unless --voice or the
-  # job's voice is set.
+  # job's voice is set. Give voices without the `.wav` extension (e.g. `Michael`); the backend
+  # appends `.wav` to form the server's predefined voice id.
   - name: tts
     protocol: chatterbox
     url: http://<inference-host>:8004
