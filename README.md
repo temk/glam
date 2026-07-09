@@ -147,6 +147,9 @@ terms never drift.
   the chatterbox backend appends `.wav` when it builds the server's voice id.
 - `mux` picks up every `tts.*.wav` and `subtitles.*.srt` in the job and adds them all as
   labeled tracks; use `--exclude <artifact>` to leave one out.
+- `tts` caches each synthesized segment under `<job>/tts/`, so a crash resumes without redoing
+  finished segments. Rerun to continue, `--start N` to resume from a specific segment, or `--force`
+  to re-synthesize everything.
 
 ## Job folder
 
@@ -163,6 +166,7 @@ jobs/<job-id>/
   translation.<lang>.fixed.json    # accent step (e.g. Russian stress), if run
   subtitles.<lang>.srt
   tts.<lang>[.<voice>].wav
+  tts/                             # per-segment TTS cache (resume support)
   <name>.mp4            # final muxed video
   result.mp4            # symlink to the latest result
 ```
@@ -178,7 +182,7 @@ uv run glam transcribe --job-id ID [--force]
 uv run glam translate  --job-id ID [--target LANG] [--batch-size N] [--context-size N] [--dump] [--force]
 uv run glam subtitles  --job-id ID [--target LANG] [--force]
 uv run glam accent     --job-id ID [--target LANG] [--force]
-uv run glam tts        --job-id ID [--target LANG] [--voice V] [--force]
+uv run glam tts        --job-id ID [--target LANG] [--voice V] [--start N] [--force]
 uv run glam mux        --job-id ID [--exclude ARTIFACT]... [--force]
 ```
 

@@ -253,6 +253,70 @@ def test_force_recreates(tmp_path, patch_chatterbox):
     assert (job_path / "tts.ru.wav").read_bytes() != b"stale"
 
 
+# --- per-segment disk cache and --start ---
+
+
+def test_caches_each_segment_to_disk(tmp_path, patch_chatterbox):
+    patch_chatterbox()
+    job_path = _make_job(tmp_path)  # segments have ids 0 and 1
+    tts_step.run("jobA", _chatterbox_config(tmp_path), echo=lambda *_: None)
+
+    cache = job_path / "tts"
+    assert (cache / "ru.0000.wav").exists()
+    assert (cache / "ru.0001.wav").exists()
+
+
+def test_resumes_from_cache_without_resynthesizing(tmp_path, patch_chatterbox):
+    calls = patch_chatterbox()
+    _make_job(tmp_path)
+    out = tts_step.run("jobA", _chatterbox_config(tmp_path), echo=lambda *_: None)
+    assert len(calls) == 2  # first run synthesized both segments
+
+    out.unlink()  # simulate a crash: cache is populated but the final track is gone
+    calls2 = patch_chatterbox()  # fresh recorder
+    tts_step.run("jobA", _chatterbox_config(tmp_path), echo=lambda *_: None)
+    assert calls2 == []  # every segment served from the cache
+    assert out.exists()  # final track rebuilt from the cache
+
+
+def test_force_resynthesizes_ignoring_cache(tmp_path, patch_chatterbox):
+    patch_chatterbox()
+    _make_job(tmp_path)
+    tts_step.run("jobA", _chatterbox_config(tmp_path), echo=lambda *_: None)  # populate cache
+
+    calls = patch_chatterbox()
+    tts_step.run("jobA", _chatterbox_config(tmp_path), force=True, echo=lambda *_: None)
+    assert len(calls) == 2  # --force re-synthesizes every segment despite the cache
+
+
+def test_start_resumes_from_given_position(tmp_path, patch_chatterbox):
+    calls = patch_chatterbox()
+    job_path = _make_job(tmp_path)
+    cache = job_path / "tts"
+    cache.mkdir()
+    (cache / "ru.0000.wav").write_bytes(_wav_bytes(0.5))  # pre-cache the first segment only
+
+    tts_step.run("jobA", _chatterbox_config(tmp_path), start=2, echo=lambda *_: None)
+
+    assert [c["json"]["text"] for c in calls] == ["Мир."]  # only the 2nd segment was synthesized
+    assert (cache / "ru.0001.wav").exists()  # and it was cached
+
+
+def test_start_errors_when_earlier_segment_not_cached(tmp_path, patch_chatterbox):
+    patch_chatterbox()
+    _make_job(tmp_path)  # no cache present
+    with pytest.raises(TtsError, match="not cached"):
+        tts_step.run("jobA", _chatterbox_config(tmp_path), start=2, echo=lambda *_: None)
+
+
+def test_cache_is_scoped_by_voice(tmp_path, patch_chatterbox):
+    patch_chatterbox()
+    job_path = _make_job(tmp_path, voice="Michael")
+    tts_step.run("jobA", _chatterbox_config(tmp_path), echo=lambda *_: None)
+
+    assert (job_path / "tts" / "ru.Michael.0000.wav").exists()
+
+
 def test_target_override_reads_and_names_that_language(tmp_path, patch_chatterbox):
     calls = patch_chatterbox()
     job_path = _make_job(tmp_path)  # translation.ru.json; job target ru

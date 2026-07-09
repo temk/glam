@@ -15,13 +15,14 @@ This step executes local pipeline logic, but the speech synthesis model is calle
 - validate the structure of translated segments;
 - call the TTS service from the config;
 - synthesize speech for the `translated_text` of each segment;
+- cache each synthesized segment to disk so a crash can be resumed without re-synthesizing;
 - combine the segments into a single audio track;
 - save the audio track as an artifact of the current job.
 
 ## CLI
 
 ```bash
-uv run glam tts --job-id JOB_ID [--target LANG] [--voice VOICE] [--config PATH] [--force]
+uv run glam tts --job-id JOB_ID [--target LANG] [--voice VOICE] [--start N] [--config PATH] [--force]
 ```
 
 The CLI is defined in `src/glam/cli.py`.
@@ -74,6 +75,35 @@ The step creates an audio artifact:
 
 The audio format is WAV.
 
+## Caching and resume
+
+Synthesizing every segment is slow, so the step must not hold all fragments only in memory: a failure
+partway through would waste the work already done. Each synthesized segment is written to a per-job
+cache directory as its own WAV file:
+
+```text
+<job_dir>/<job-id>/tts/<target>[.<voice>].<segment-id>.wav
+```
+
+The cache is keyed by target language and voice (and the zero-padded segment id), so several
+languages and voices coexist in one job without clashing.
+
+On each run the step processes segments in order and, for each one:
+
+- if a cached file for it already exists and `--force` is not set, it is reused (no synthesis);
+- otherwise the segment is synthesized and written to the cache.
+
+This makes a rerun resume automatically: only the missing segments are synthesized. `--force`
+re-synthesizes every segment, ignoring the cache.
+
+`--start N` begins at the N-th segment (1-based, matching the progress counter). Segments before N are
+taken from the cache and are **not** synthesized; if a required earlier segment is not cached, the
+step fails with a clear error. Combine `--start N --force` to redo the tail from N while keeping the
+earlier cached segments.
+
+Unlike other steps, an existing final `tts.<target>.wav` is skipped only on a plain run; passing
+`--force` or `--start` runs anyway.
+
 ## Synchronization
 
 The basic version of the step must preserve the segment order and create a continuous audio track.
@@ -98,10 +128,11 @@ An invalid or incomplete backend response must be converted into a clear error.
 
 ## Artifact ownership
 
-`tts` owns only its own artifact:
+`tts` owns its final artifact and its segment cache:
 
 ```text
 tts.<target>.wav
+tts/                     # per-segment WAV cache (see "Caching and resume")
 ```
 
 ## Errors
@@ -124,8 +155,9 @@ Expected errors:
 - no voice resolved for the `openai` protocol (which requires one);
 - TTS service is unavailable;
 - TTS service returned an invalid response;
+- `--start` refers to a position whose earlier segments are not cached;
 - unable to assemble the final audio track;
-- unable to write the audio file.
+- unable to write the audio file or cache a segment.
 
 Expected errors must be converted into clear CLI errors through the project's base error class.
 
@@ -149,6 +181,11 @@ Tests for `tts` must cover:
 - adding silence between segments when needed;
 - handling an overly long synthesized fragment;
 - skipping the step if the file already exists;
+- caching each synthesized segment under `tts/`;
+- resuming from the cache without re-synthesizing (e.g. after the final track is lost);
+- re-synthesizing every segment with `--force`;
+- resuming synthesis from `--start N`, taking earlier segments from the cache;
+- erroring when `--start` needs an earlier segment that is not cached;
 - recreating the file with `--force`;
 - an error when `translation.<target>.json` is missing;
 - an error when `translation.<target>.json` has an invalid format;

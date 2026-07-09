@@ -20,6 +20,10 @@ from glam.common.translation import (
 TTS_NAME_TEMPLATE = "tts.{}.wav"
 TTS_VOICE_NAME_TEMPLATE = "tts.{}.{}.wav"
 
+# Each synthesized segment is cached here as its own WAV so a crash (or `--start`) can resume without
+# re-synthesizing everything. Files are keyed by target[.voice] so several languages/voices coexist.
+TTS_CACHE_DIRNAME = "tts"
+
 
 class TtsError(GlamError):
     pass
@@ -38,7 +42,13 @@ class _Fragment:
 
 
 def run(
-    job_id: str, config: Config, target: str | None = None, voice: str | None = None, force: bool = False, echo=print
+    job_id: str,
+    config: Config,
+    target: str | None = None,
+    voice: str | None = None,
+    force: bool = False,
+    start: int | None = None,
+    echo=print,
 ) -> Path:
     """Synthesize a dubbed target-language audio track from a job's translated segments."""
     job_path = config.job_dir / job_id
@@ -55,13 +65,16 @@ def run(
 
     name = TTS_VOICE_NAME_TEMPLATE.format(target, voice) if voice else TTS_NAME_TEMPLATE.format(target)
     output_path = job_path / name
-    if output_path.exists() and not force:
+    # `--start` (like `--force`) means "run anyway": don't skip on an existing output.
+    if output_path.exists() and not force and start is None:
         echo(f"skip tts, already exists: {output_path}")
         return output_path
 
     segments = load_translated_segments(_translation_source(job_path, target, echo))
     service = config[ServiceName.TTS]
-    fragments = _synthesize(segments, service, target, voice, echo)
+    cache_dir = job_path / TTS_CACHE_DIRNAME
+    cache_key = f"{target}.{voice}" if voice else target
+    fragments = _synthesize(segments, service, target, voice, cache_dir, cache_key, force, start, echo)
     _assemble(output_path, segments, fragments)
 
     echo(f"wrote {output_path} ({len(segments)} segments)")
@@ -78,16 +91,50 @@ def _translation_source(job_path: Path, target: str, echo) -> Path:
 
 
 def _synthesize(
-    segments: list[TranslatedSegment], service: ServiceConfig, target: str, voice: str | None, echo
+    segments: list[TranslatedSegment],
+    service: ServiceConfig,
+    target: str,
+    voice: str | None,
+    cache_dir: Path,
+    cache_key: str,
+    force: bool,
+    start: int | None,
+    echo,
 ) -> list[_Fragment]:
-    backend = build_tts_backend(service)
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    backend = None  # built lazily, so a pure resume from cache needs no backend at all
     total = len(segments)
     fragments = []
     for index, segment in enumerate(segments, start=1):
-        echo(f"[{datetime.now():%H:%M:%S}] synthesizing segment {index}/{total}")
-        audio = backend.synthesize(segment.translated_text, target=target, voice=voice)
+        cache_path = cache_dir / f"{cache_key}.{segment.id:04d}.wav"
+        stamp = f"[{datetime.now():%H:%M:%S}]"
+        if start is not None and index < start:
+            # `--start` says these earlier segments are already done; take them from the cache.
+            if not cache_path.exists():
+                raise TtsError(
+                    f"--start {start}: segment {index} (id {segment.id}) is not cached at {cache_path}; "
+                    "use a lower --start or run without it"
+                )
+            echo(f"{stamp} segment {index}/{total}: before --start, using cache")
+            audio = cache_path.read_bytes()
+        elif cache_path.exists() and not force:
+            echo(f"{stamp} segment {index}/{total}: using cache")
+            audio = cache_path.read_bytes()
+        else:
+            echo(f"{stamp} synthesizing segment {index}/{total}")
+            if backend is None:
+                backend = build_tts_backend(service)
+            audio = backend.synthesize(segment.translated_text, target=target, voice=voice)
+            _cache_segment(cache_path, audio, segment)
         fragments.append(_read_wav(audio, segment))
     return fragments
+
+
+def _cache_segment(cache_path: Path, audio: bytes, segment: TranslatedSegment) -> None:
+    try:
+        cache_path.write_bytes(audio)
+    except OSError as e:
+        raise TtsError(f"unable to cache segment {segment.id} to {cache_path}: {e}") from e
 
 
 def _read_wav(data: bytes, segment: TranslatedSegment) -> _Fragment:

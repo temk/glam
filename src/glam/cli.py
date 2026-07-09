@@ -168,17 +168,23 @@ def accent_cmd(job_id, target, config_path, force):
 @job_id_option
 @target_option
 @click.option("--voice", default=None, help="Voice to synthesize with, overriding the job's voice from job.yaml")
+@click.option(
+    "--start",
+    type=int,
+    default=None,
+    help="Resume from this segment number (1-based); earlier segments are taken from the on-disk cache",
+)
 @config_option
-@click.option("--force", is_flag=True, help="Recompute even if the audio track already exists")
+@click.option("--force", is_flag=True, help="Re-synthesize every segment even if cached")
 @handle_glam_errors
-def tts_cmd(job_id, target, voice, config_path, force):
+def tts_cmd(job_id, target, voice, start, config_path, force):
     """Synthesize a dubbed target-language audio track through the configured TTS service."""
     # Imported here, not at module top, so `--help` and local commands do not pull in
     # the OpenAI SDK. See docs/architecture.md "CLI layout".
     from glam.steps import tts as tts_step
 
     config = read_config(config_path)
-    tts_step.run(job_id, config, target=target, voice=voice, force=force, echo=click.echo)
+    tts_step.run(job_id, config, target=target, voice=voice, force=force, start=start, echo=click.echo)
 
 
 @main.command("mux")
