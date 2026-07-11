@@ -216,52 +216,6 @@ def test_retries_missing_segments(tmp_path, monkeypatch):
     assert [s["translated_text"] for s in data["segments"]] == ["tr0", "tr1"]
 
 
-def test_dump_writes_one_file_per_batch(tmp_path, patch_client):
-    segments = [{"id": i, "start": float(i), "end": float(i) + 1, "text": f"s{i}"} for i in range(25)]
-    patch_client()
-    job_path = _make_job(tmp_path, transcript={**TRANSCRIPT, "segments": segments})
-
-    translate_step.run("jobA", _config(tmp_path), echo=lambda *_: None, dump=True, batch_size=10)
-
-    dump_dir = job_path / "translate.ru.dump"
-    assert not (dump_dir / "004.json").exists()  # only 3 batches for 25 segments
-    batch2 = json.loads((dump_dir / "002.json").read_text())
-    assert isinstance(batch2, list) and len(batch2) == 1
-    entry = batch2[0]
-    assert entry["requested_ids"] == list(range(10, 20))  # this file holds only its batch
-    assert entry["request"]["messages"][0]["role"] == "system"
-    assert "content" in entry["response"]
-
-
-def test_dump_records_every_retry_round(tmp_path, monkeypatch):
-    _make_job(tmp_path)  # two segments, ids 0 and 1
-    calls: list[dict] = []
-
-    def create(**kwargs):
-        calls.append(kwargs)
-        ids = [s["id"] for s in json.loads(kwargs["messages"][1]["content"])["translate"]]
-        if len(calls) == 1:
-            ids = [i for i in ids if i != 1]  # first round drops one → forces a retry
-        content = _reply([{"id": i, "translated_text": f"tr{i}"} for i in ids])
-        return SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(content=content))])
-
-    client = SimpleNamespace(chat=SimpleNamespace(completions=SimpleNamespace(create=create)))
-    monkeypatch.setattr("openai.OpenAI", lambda **kwargs: client)
-
-    translate_step.run("jobA", _config(tmp_path), echo=lambda *_: None, dump=True)
-
-    records = json.loads((tmp_path / "jobA" / "translate.ru.dump" / "001.json").read_text())
-    assert len(records) == 2  # both the initial request and the retry are dumped
-
-
-def test_no_dump_file_by_default(tmp_path, patch_client):
-    patch_client()
-    job_path = _make_job(tmp_path)
-    translate_step.run("jobA", _config(tmp_path), echo=lambda *_: None)
-
-    assert not (job_path / "translate.ru.dump").exists()
-
-
 def test_reports_progress(tmp_path, patch_client):
     segments = [{"id": i, "start": float(i), "end": float(i) + 1, "text": f"s{i}"} for i in range(25)]
     patch_client()
@@ -272,6 +226,71 @@ def test_reports_progress(tmp_path, patch_client):
 
     assert any("translating segments 1-10 of 25" in m for m in messages)
     assert any("translating segments 21-25 of 25" in m for m in messages)
+
+
+# --- per-segment disk cache and --start ---
+
+
+def _requested_ids(calls) -> list[int]:
+    ids: list[int] = []
+    for kwargs in calls:
+        payload = json.loads(kwargs["messages"][1]["content"])
+        ids += [s["id"] for s in payload["translate"]]
+    return ids
+
+
+def test_caches_each_segment_to_disk(tmp_path, patch_client):
+    patch_client()
+    job_path = _make_job(tmp_path)  # segments have ids 0 and 1
+    translate_step.run("jobA", _config(tmp_path), echo=lambda *_: None)
+
+    cache = job_path / "translate"
+    assert json.loads((cache / "ru.00000.json").read_text())["translated_text"] == "tr:Hello."
+    assert json.loads((cache / "ru.00001.json").read_text())["translated_text"] == "tr:World."
+
+
+def test_resumes_from_cache_without_rerequesting(tmp_path, patch_client):
+    calls = patch_client()
+    _make_job(tmp_path)
+    out = translate_step.run("jobA", _config(tmp_path), echo=lambda *_: None)
+    assert len(calls) == 1  # first run made one request
+
+    out.unlink()  # simulate a crash: cache is populated but the final file is gone
+    calls2 = patch_client()  # fresh recorder
+    translate_step.run("jobA", _config(tmp_path), echo=lambda *_: None)
+    assert calls2 == []  # every segment served from the cache
+    assert [s["translated_text"] for s in json.loads(out.read_text())["segments"]] == ["tr:Hello.", "tr:World."]
+
+
+def test_force_retranslates_ignoring_cache(tmp_path, patch_client):
+    patch_client()
+    _make_job(tmp_path)
+    translate_step.run("jobA", _config(tmp_path), echo=lambda *_: None)  # populate cache
+
+    calls = patch_client()
+    translate_step.run("jobA", _config(tmp_path), force=True, echo=lambda *_: None)
+    assert _requested_ids(calls) == [0, 1]  # --force re-requests every segment
+
+
+def test_start_resumes_from_given_position(tmp_path, patch_client):
+    calls = patch_client()
+    job_path = _make_job(tmp_path)
+    cache = job_path / "translate"
+    cache.mkdir()
+    (cache / "ru.00000.json").write_text(json.dumps({"id": 0, "translated_text": "cached0"}))
+
+    path = translate_step.run("jobA", _config(tmp_path), start=2, echo=lambda *_: None)
+
+    assert _requested_ids(calls) == [1]  # only the 2nd segment was translated
+    texts = [s["translated_text"] for s in json.loads(path.read_text())["segments"]]
+    assert texts == ["cached0", "tr:World."]  # first from cache, second freshly translated
+
+
+def test_start_errors_when_earlier_segment_not_cached(tmp_path, patch_client):
+    patch_client()
+    _make_job(tmp_path)  # no cache present
+    with pytest.raises(TranslateError, match="not cached"):
+        translate_step.run("jobA", _config(tmp_path), start=2, echo=lambda *_: None)
 
 
 def test_skips_when_translation_exists(tmp_path, patch_client):

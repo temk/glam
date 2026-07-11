@@ -16,20 +16,22 @@ The step runs local pipeline code, but the translation model is called through a
 - call the translation service from the config;
 - translate the text of each segment into the target language;
 - apply glossary rules during translation;
+- cache each translated segment to disk so a crash can be resumed without re-translating;
 - preserve the segment structure from the transcript;
 - create the `translation.<target>.json` artifact.
 
 ## CLI
 
 ```bash
-uv run glam translate --job-id JOB_ID [--target LANG] [--config PATH] [--batch-size N] [--context-size N] [--dump] [--force]
+uv run glam translate --job-id JOB_ID [--target LANG] [--config PATH] [--batch-size N] [--context-size N] [--start N] [--force]
 ```
 
 - `--target` — target language code, overriding the job's default target from `job.yaml`.
 - `--batch-size` — number of segments translated per model request (default: 100).
 - `--context-size` — number of already-translated preceding segments sent read-only with each
   batch for continuity (default: 100).
-- `--dump` — write the raw model request/response exchange to per-batch dump files (see "Debug dump").
+- `--start` — resume from the N-th segment (1-based); earlier segments are taken from the cache
+  (see "Caching and resume").
 
 The CLI is defined in `src/glam/cli.py`.
 
@@ -66,22 +68,31 @@ adding the `translated_text` field to each segment.
 
 The step prints per-batch progress with a timestamp while running.
 
-## Debug dump
+## Caching and resume
 
-When `--dump` is set, the step writes the raw model exchange into a per-language dump folder in the
-job directory, one file per batch:
+Translating a long transcript makes many model calls, so the step must not hold results only in
+memory: a failure partway through would waste the work already done. Each translated segment is
+written to a per-job cache directory as its own JSON file (`{id, translated_text}`):
 
 ```text
-<job_dir>/<job-id>/translate.<target>.dump/<nnn>.json
+<job_dir>/<job-id>/translate/<target>.<segment-id>.json
 ```
 
-`<target>` is the target language and `<nnn>` is the 1-based batch number, zero-padded to three digits so the files sort naturally. Each file is a JSON array of that batch's request/response
-exchanges — every model call, including retry rounds and failed calls — recording the request
-messages and the raw response content (or error). The file is rewritten after each request, so the
-dump survives a mid-step crash. The folder is created at the start of a dumping run and cleared of
-stale batch files from earlier runs.
+The cache is keyed by target language (and the zero-padded segment id), so several languages coexist
+in one job without clashing.
 
-Dump files are debug artifacts, not pipeline inputs: no downstream step reads them.
+On each run the step first fills in every segment already present in the cache, then translates only
+the remaining segments (batched, with the usual `context` from preceding translations — which may be
+cached ones). This makes a rerun resume automatically: only the missing segments are sent to the
+model. `--force` re-translates every segment, ignoring the cache.
+
+`--start N` begins at the N-th segment (1-based, matching the progress counter). Segments before N are
+taken from the cache and are **not** re-translated; if a required earlier segment is not cached, the
+step fails with a clear error. Combine `--start N --force` to redo the tail from N while keeping the
+earlier cached segments.
+
+Unlike a plain run, passing `--force` or `--start` runs even when `translation.<target>.json` already
+exists.
 
 ## Segment preservation
 
@@ -136,17 +147,20 @@ that a schema cannot fix.
 
 ## Artifact ownership
 
-`translate` owns only its own artifact:
+`translate` owns its final artifact and its segment cache:
 
 ```text
 translation.<target>.json
+translate/               # per-segment translation cache (see "Caching and resume")
 ```
 
 It does not modify artifacts owned by other steps.
 
 ## Idempotency and `--force`
 
-`translate` must be idempotent.
+`translate` must be idempotent. A plain run whose `translation.<target>.json` already exists is
+skipped; `--force` recomputes it and `--start` resumes it (both run even when the output exists). The
+per-segment cache lets a rerun continue where a crash stopped instead of starting over.
 
 ## Errors
 
@@ -164,7 +178,9 @@ Expected errors:
 - translation service unavailable;
 - translation service returned an invalid response;
 - translation response was truncated by the model's output token limit;
-- the model did not translate all segments (missing segment IDs) after all retry rounds.
+- the model did not translate all segments (missing segment IDs) after all retry rounds;
+- `--start` refers to a position whose earlier segments are not cached;
+- unable to write the translation or cache a segment.
 
 Expected errors must be converted into clear CLI errors through the base error class.
 
@@ -199,5 +215,8 @@ Tests for `translate` must cover:
 - sending preceding translations as `context` for continuity;
 - recovering segments the model drops from a batch by re-requesting them;
 - printing per-batch progress;
-- writing per-batch dump files incrementally when `--dump` is set;
-- not writing dump files by default.
+- caching each translated segment under `translate/`;
+- resuming from the cache without re-requesting (e.g. after the final file is lost);
+- re-translating every segment with `--force`;
+- resuming translation from `--start N`, taking earlier segments from the cache;
+- erroring when `--start` needs an earlier segment that is not cached.

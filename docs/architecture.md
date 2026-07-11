@@ -189,7 +189,7 @@ output exists + --force → recompute
 
 A step must not accidentally overwrite artifacts created by another backend/model/config variant. If different backends/models produce different results, this must be reflected in the artifact name or location.
 
-A step whose work is expensive and made of many independent items may additionally cache those items on disk so a failure can be resumed without redoing finished work. Such a cache is an internal resume aid, not the step's output: reruns reuse it, `--force` rebuilds it, and the step may offer a resume option to start partway through. `tts` does this — it caches each synthesized segment under `<job>/tts/` and takes `--start N` to resume (see `docs/steps/tts.md`).
+A step whose work is expensive and made of many independent items may additionally cache those items on disk so a failure can be resumed without redoing finished work. Such a cache is an internal resume aid, not the step's output: reruns reuse it, `--force` rebuilds it, and the step may offer a resume option to start partway through. `translate` and `tts` do this — they cache each finished segment under `<job>/translate/` and `<job>/tts/` and take `--start N` to resume (see `docs/steps/translate.md` and `docs/steps/tts.md`).
 
 ## Local and remote steps
 

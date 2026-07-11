@@ -16,8 +16,6 @@ class ChatResult:
 
 
 class TranslateBackend(ABC):
-    model: str  # model label recorded in dump files
-
     @abstractmethod
     def complete(self, messages: list[dict], response_format: dict) -> ChatResult:
         """Run one chat completion and return its content and finish reason."""

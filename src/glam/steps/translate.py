@@ -6,17 +6,17 @@ from datetime import datetime
 from dataclasses import asdict, dataclass
 
 from glam.common.job import JOB_MANIFEST_NAME, read_job_manifest
-from glam.common.config import Config, ServiceName
+from glam.common.config import Config, ServiceName, ServiceConfig
 from glam.common.errors import GlamError
 from glam.common.translation import translation_filename
-from glam.backend.translate.base import ChatResult, TranslateBackend, TranslateBackendError, build_translate_backend
+from glam.backend.translate.base import ChatResult, TranslateBackend, build_translate_backend
 
 TRANSCRIPT_NAME = "transcript.json"
 GLOSSARY_NAME = "glossary.json"
-# Debug dumps go into a per-language folder (`{}` is the target language, e.g. `translate.ru.dump/`),
-# one file per batch inside it, named by the 1-based batch number zero-padded so files sort naturally.
-DUMP_DIR_TEMPLATE = "translate.{}.dump"
-DUMP_FILE_TEMPLATE = "{:03d}.json"
+
+# Each translated segment is cached here as its own JSON so a crash (or `--start`) can resume without
+# re-translating finished work. Files are keyed by target so several languages coexist in one job.
+TRANSLATE_CACHE_DIRNAME = "translate"
 
 # Default segments translated per request.
 BATCH_SIZE = 100
@@ -92,7 +92,7 @@ def run(
     echo=print,
     batch_size: int = BATCH_SIZE,
     context_size: int = CONTEXT_SIZE,
-    dump: bool = False,
+    start: int | None = None,
 ) -> Path:
     """Translate a job's transcript through the configured LLM service into `translation.<target>.json`."""
     job_path = config.job_dir / job_id
@@ -107,38 +107,30 @@ def run(
     glossary = _load_glossary(job_path / GLOSSARY_NAME)
 
     translation_path = job_path / translation_filename(target)
-    if translation_path.exists() and not force:
+    # `--start` (like `--force`) means "run anyway": don't skip on an existing output.
+    if translation_path.exists() and not force and start is None:
         echo(f"skip translation, already exists: {translation_path}")
         return translation_path
 
-    backend = build_translate_backend(config[ServiceName.TRANSLATE])
-    # When dumping, each batch writes its own file inside translate.<target>.dump/, rewritten after
-    # every request (retries included) so the exchange survives a mid-step crash.
-    dump_dir = job_path / DUMP_DIR_TEMPLATE.format(target) if dump else None
-    if dump_dir is not None:
-        _prepare_dump_dir(dump_dir)
+    service = config[ServiceName.TRANSLATE]
     _apply_translations(
         translation,
         manifest.languages.source,
         target,
         glossary,
-        backend,
+        service,
         echo,
         batch_size,
         context_size,
-        dump_dir,
+        job_path / TRANSLATE_CACHE_DIRNAME,
+        target,
+        force,
+        start,
     )
 
     translation_path.write_text(json.dumps(asdict(translation), ensure_ascii=False, indent=2) + "\n")
     echo(f"wrote {translation_path} ({len(translation.segments)} segments)")
     return translation_path
-
-
-def _prepare_dump_dir(path: Path) -> None:
-    """Create the dump folder and drop stale batch files so it reflects only the current run."""
-    path.mkdir(parents=True, exist_ok=True)
-    for stale in path.glob("*.json"):
-        stale.unlink()
 
 
 def _load_transcript(path: Path) -> Translation:
@@ -168,25 +160,78 @@ def _apply_translations(
     source: str,
     target: str,
     glossary: dict[str, str],
-    backend: TranslateBackend,
+    service: ServiceConfig,
     echo,
     batch_size: int,
     context_size: int,
-    dump_dir: Path | None,
+    cache_dir: Path,
+    cache_key: str,
+    force: bool,
+    start: int | None,
 ) -> None:
     system_prompt = _system_prompt(source, target, glossary)
     segments = translation.segments
     total = len(segments)
-    for index, start in enumerate(range(0, total, batch_size), start=1):
-        batch = segments[start : start + batch_size]
-        # Preceding segments, already translated in earlier batches, give the model
-        # target-language continuity. They are read-only and not expected back.
-        context = segments[max(0, start - context_size) : start]
-        echo(f"[{datetime.now():%H:%M:%S}] translating segments {start + 1}-{start + len(batch)} of {total}")
-        dump_path = dump_dir / DUMP_FILE_TEMPLATE.format(index) if dump_dir is not None else None
-        translations = _translate(backend, batch, context, system_prompt, dump_path)
+    cache_dir.mkdir(parents=True, exist_ok=True)
+
+    # Fill in segments already on disk; `--start` marks earlier ones as done (they must be cached).
+    _apply_cache(segments, cache_dir, cache_key, force, start)
+    pending = [(index, segment) for index, segment in enumerate(segments) if segment.translated_text is None]
+    if not pending:
+        echo("all segments already translated (from cache)")
+        return
+
+    backend = build_translate_backend(service)  # built only when there is work to do
+    for group_start in range(0, len(pending), batch_size):
+        chunk = pending[group_start : group_start + batch_size]
+        batch = [segment for _, segment in chunk]
+        first, last = chunk[0][0], chunk[-1][0]
+        # Preceding segments (cached or translated earlier this run) give the model target-language
+        # continuity. They are read-only and not expected back.
+        context = segments[max(0, first - context_size) : first]
+        echo(f"[{datetime.now():%H:%M:%S}] translating segments {first + 1}-{last + 1} of {total}")
+        translations = _translate(backend, batch, context, system_prompt)
         for segment in batch:
             segment.translated_text = translations[segment.id]
+        _cache_segments(batch, cache_dir, cache_key)
+
+
+def _cache_path(cache_dir: Path, cache_key: str, segment_id: int) -> Path:
+    return cache_dir / f"{cache_key}.{segment_id:05d}.json"
+
+
+def _apply_cache(
+    segments: list[TranslatedSegment], cache_dir: Path, cache_key: str, force: bool, start: int | None
+) -> None:
+    for index, segment in enumerate(segments):
+        position = index + 1
+        cache_path = _cache_path(cache_dir, cache_key, segment.id)
+        if start is not None and position < start:
+            if not cache_path.exists():
+                raise TranslateError(
+                    f"--start {start}: segment {position} (id {segment.id}) is not cached at {cache_path}; "
+                    "use a lower --start or run without it"
+                )
+            segment.translated_text = _read_cache(cache_path)
+        elif cache_path.exists() and not force:
+            segment.translated_text = _read_cache(cache_path)
+
+
+def _read_cache(path: Path) -> str:
+    try:
+        return str(json.loads(path.read_text())["translated_text"])
+    except (json.JSONDecodeError, KeyError, TypeError, OSError) as e:
+        raise TranslateError(f"invalid translation cache {path}: {e}") from e
+
+
+def _cache_segments(segments: list[TranslatedSegment], cache_dir: Path, cache_key: str) -> None:
+    for segment in segments:
+        path = _cache_path(cache_dir, cache_key, segment.id)
+        record = {"id": segment.id, "translated_text": segment.translated_text}
+        try:
+            path.write_text(json.dumps(record, ensure_ascii=False) + "\n")
+        except OSError as e:
+            raise TranslateError(f"unable to cache segment {segment.id} to {path}: {e}") from e
 
 
 def _system_prompt(source: str, target: str, glossary: dict[str, str]) -> str:
@@ -213,16 +258,14 @@ def _translate(
     segments: list[TranslatedSegment],
     context: list[TranslatedSegment],
     system_prompt: str,
-    dump_path: Path | None,
 ) -> dict[int, str]:
     by_id = {segment.id: segment for segment in segments}
     result: dict[int, str] = {}
-    records: list[dict] = []  # every request/response of this batch, dumped incrementally
     for _ in range(MAX_ROUNDS):
         pending = [by_id[i] for i in by_id if i not in result]
         if not pending:
             return result
-        result.update(_request(backend, pending, context, system_prompt, records, dump_path))
+        result.update(_request(backend, pending, context, system_prompt))
     missing = sorted(i for i in by_id if i not in result)
     raise TranslateError(
         f"model did not translate {len(missing)} segment(s) after {MAX_ROUNDS} attempts "
@@ -235,8 +278,6 @@ def _request(
     segments: list[TranslatedSegment],
     context: list[TranslatedSegment],
     system_prompt: str,
-    records: list[dict],
-    dump_path: Path | None,
 ) -> dict[int, str]:
     payload = {
         # Context is bare translated text (not structured), giving the model target-language
@@ -248,35 +289,8 @@ def _request(
         {"role": "system", "content": system_prompt},
         {"role": "user", "content": json.dumps(payload, ensure_ascii=False)},
     ]
-    try:
-        result = backend.complete(messages, RESPONSE_FORMAT)
-    except TranslateBackendError as e:
-        _record(records, dump_path, backend.model, segments, messages, error=str(e))
-        raise
-    _record(
-        records,
-        dump_path,
-        backend.model,
-        segments,
-        messages,
-        content=result.content,
-        finish_reason=result.finish_reason,
-    )
+    result = backend.complete(messages, RESPONSE_FORMAT)
     return _parse_response(result, {segment.id for segment in segments})
-
-
-def _record(records, dump_path, model, segments, messages, content=None, finish_reason=None, error=None) -> None:
-    """Append this exchange to the batch's records and, when dumping, rewrite its file."""
-    records.append(
-        {
-            "model": model,
-            "requested_ids": sorted(segment.id for segment in segments),
-            "request": {"messages": messages},
-            "response": {"content": content, "finish_reason": finish_reason, "error": error},
-        }
-    )
-    if dump_path is not None:
-        dump_path.write_text(json.dumps(records, ensure_ascii=False, indent=2) + "\n")
 
 
 def _parse_response(result: ChatResult, requested_ids: set[int]) -> dict[int, str]:

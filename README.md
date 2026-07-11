@@ -147,9 +147,9 @@ terms never drift.
   the chatterbox backend appends `.wav` when it builds the server's voice id.
 - `mux` picks up every `tts.*.wav` and `subtitles.*.srt` in the job and adds them all as
   labeled tracks; use `--exclude <artifact>` to leave one out.
-- `tts` caches each synthesized segment under `<job>/tts/`, so a crash resumes without redoing
-  finished segments. Rerun to continue, `--start N` to resume from a specific segment, or `--force`
-  to re-synthesize everything.
+- `translate` and `tts` cache each finished segment under `<job>/translate/` and `<job>/tts/`, so a
+  crash resumes without redoing completed segments. Rerun to continue, `--start N` to resume from a
+  specific segment, or `--force` to redo everything.
 
 ## Job folder
 
@@ -164,6 +164,7 @@ jobs/<job-id>/
   transcript.json       # transcribe output
   translation.<lang>.json
   translation.<lang>.fixed.json    # accent step (e.g. Russian stress), if run
+  translate/                       # per-segment translation cache (resume support)
   subtitles.<lang>.srt
   tts.<lang>[.<voice>].wav
   tts/                             # per-segment TTS cache (resume support)
@@ -179,15 +180,14 @@ the downstream steps.
 ```bash
 uv run glam init <video> [--source LANG] [--target LANG] [--glossary PATH] [--voice V] [--job-id ID] [--force]
 uv run glam transcribe --job-id ID [--force]
-uv run glam translate  --job-id ID [--target LANG] [--batch-size N] [--context-size N] [--dump] [--force]
+uv run glam translate  --job-id ID [--target LANG] [--batch-size N] [--context-size N] [--start N] [--force]
 uv run glam subtitles  --job-id ID [--target LANG] [--force]
 uv run glam accent     --job-id ID [--target LANG] [--force]
 uv run glam tts        --job-id ID [--target LANG] [--voice V] [--start N] [--force]
 uv run glam mux        --job-id ID [--exclude ARTIFACT]... [--force]
 ```
 
-All commands accept `-c/--config PATH`. `--dump` on `translate` writes the raw model
-exchanges into `translate.<lang>.dump/` for debugging.
+All commands accept `-c/--config PATH`.
 
 ## Learn more
 
