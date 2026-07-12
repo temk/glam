@@ -4,6 +4,7 @@ from dacite import DaciteError
 from dacite import from_dict as dacite_from_dict
 from pathlib import Path
 from datetime import datetime
+from collections import Counter
 from dataclasses import asdict, dataclass
 
 from glam.common.job import JOB_MANIFEST_NAME, read_job_manifest
@@ -26,17 +27,14 @@ DUMP_FILE_TEMPLATE = "{:05d}.json"
 # re-translating finished work. Files are keyed by target so several languages coexist in one job.
 TRANSLATE_CACHE_DIRNAME = "translate"
 
-# Default segments translated per request.
-BATCH_SIZE = 30
+# Default segments translated per request. One keeps the id-to-text mapping unambiguous: the model
+# cannot re-segment a single-item batch, which is the only fully drift-proof case (see `_translate`).
+BATCH_SIZE = 1
 # Default number of already-translated preceding segments sent read-only ahead of each batch.
-CONTEXT_SIZE = 20
-# Default number of following source segments appended to the source-language window, so the model
-# can see how each sentence ends before translating its opening (word order differs across languages).
-LOOKAHEAD_SIZE = 10
-
-# Weak local models occasionally drop a few segments from a large batch; re-request the
-# stragglers this many rounds before giving up.
-MAX_ROUNDS = 6
+CONTEXT_SIZE = 5
+# Default number of following source segments given as read-only source context, so the model can see
+# how each sentence ends before translating its opening (word order differs across languages).
+LOOKAHEAD_SIZE = 2
 
 # Constrained decoding: providers that honor it (Ollama, vLLM, OpenAI) can only emit tokens
 # matching this schema, which rules out the malformed JSON weak models otherwise produce.
@@ -210,14 +208,14 @@ def _apply_translations(
         chunk = pending[group_start : group_start + batch_size]
         batch = [segment for _, segment in chunk]
         first, last = chunk[0][0], chunk[-1][0]
-        # Preceding segments (cached or translated earlier this run) give the model target-language
-        # continuity. They are read-only and not expected back.
-        context = segments[max(0, first - context_size) : first]
-        # The source-language window spans the same preceding segments, the batch itself, and a few
-        # following segments, so the model can see how each sentence ends before translating its start.
-        source_window = segments[max(0, first - context_size) : min(total, last + 1 + lookahead_size)]
+        # The segments immediately before and after the batch, in the source language, given as separate
+        # reference so the model sees where each sentence begins and ends without confusing that
+        # surrounding text with the batch it must translate. `before` doubles as the target-language
+        # continuity context (its already-translated text).
+        before = segments[max(0, first - context_size) : first]
+        after = segments[last + 1 : min(total, last + 1 + lookahead_size)]
         echo(f"[{datetime.now():%H:%M:%S}] translating segments {first + 1}-{last + 1} of {total}")
-        translations = _translate(backend, batch, context, source_window, system_prompt, dump_dir, dump_counter)
+        translations = _translate(backend, batch, before, after, system_prompt, dump_dir, dump_counter)
         for segment in batch:
             segment.translated_text = translations[segment.id]
         _cache_segments(batch, cache_dir, cache_key)
@@ -271,16 +269,20 @@ def _cache_segments(segments: list[TranslatedSegment], cache_dir: Path, cache_ke
 def _system_prompt(source: str, target: str, glossary: dict[str, str]) -> str:
     lines = [
         f"You translate subtitle segments from {source} to {target} for technical and educational videos.",
-        "The user message is a JSON object with:",
-        "- 'source_window': the surrounding source-language text (before, within, and after the segments to "
-        "translate), as plain text, so you can see how each sentence begins and ends — read it for understanding "
-        "only; do NOT translate or return it;",
-        "- 'context': the already-translated target-language text immediately preceding these segments, as plain "
-        "text for continuity and consistent terminology only — do NOT translate or return it;",
-        "- 'translate': the segments to translate, as an array of {id, text}.",
+        "The user message is a JSON object with these fields:",
+        "- 'translate': the segments you must translate, as an array of {id, text}. This is the ONLY text to "
+        "translate.",
+        "- 'text_before': the source-language text right BEFORE these segments — reference for context only; do NOT "
+        "translate or return it;",
+        "- 'text_after': the source-language text right AFTER these segments — reference for context only; do NOT "
+        "translate or return it;",
+        "- 'translated_before': the target-language translation of 'text_before' (how the preceding text was "
+        "already translated), so you keep terminology and wording consistent — reference only; do NOT translate or "
+        "return it.",
         'Reply with ONLY a JSON object of the form {"segments": [{"id": <int>, "translated_text": "<translation>"}]}.',
-        "Translate EVERY 'translate' item: return exactly one entry per id, the same number of entries as the input, "
-        "reusing the same ids. Never skip, merge, split, add, drop, or reorder segments.",
+        "Return exactly one entry per 'translate' item, in the same order, reusing its id. Translate ONLY that "
+        "item's own text — never fold in words from 'text_before' or 'text_after'. Never merge, split, add, drop, "
+        "or reorder segments.",
     ]
     if glossary:
         lines.append("Apply this glossary strictly wherever a term appears; render each term exactly as specified:")
@@ -293,43 +295,55 @@ def _system_prompt(source: str, target: str, glossary: dict[str, str]) -> str:
 def _translate(
     backend: TranslateBackend,
     segments: list[TranslatedSegment],
-    context: list[TranslatedSegment],
-    source_window: list[TranslatedSegment],
+    before: list[TranslatedSegment],
+    after: list[TranslatedSegment],
     system_prompt: str,
     dump_dir: Path | None,
     dump_counter: "itertools.count[int]",
 ) -> dict[int, str]:
-    by_id = {segment.id: segment for segment in segments}
-    result: dict[int, str] = {}
-    for _ in range(MAX_ROUNDS):
-        pending = [by_id[i] for i in by_id if i not in result]
-        if not pending:
-            return result
-        result.update(_request(backend, pending, context, source_window, system_prompt, dump_dir, dump_counter))
-    missing = sorted(i for i in by_id if i not in result)
-    raise TranslateError(
-        f"model did not translate {len(missing)} segment(s) after {MAX_ROUNDS} attempts "
-        f"(e.g. ids {missing[:5]}); try a smaller --batch-size"
-    )
+    """Translate a batch, trusting the model's ids only when the reply is an exact 1:1 match.
+
+    Weak models re-segment: they merge or split fragments and renumber the outputs 0,1,2,… so the ids
+    stop labelling the source segments (this silently misaligns translations). When the returned ids are
+    not exactly the requested ones, the labels are untrustworthy, so the batch is split and each half
+    retried — down to a single segment, whose lone translation is taken by position (its returned id is
+    ignored), which is the only unambiguous case.
+    """
+    requested_ids = [segment.id for segment in segments]
+    pairs = _request(backend, segments, before, after, system_prompt, dump_dir, dump_counter)
+    if Counter(pid for pid, _ in pairs) == Counter(requested_ids):
+        return dict(pairs)
+
+    if len(segments) == 1:
+        only = segments[0]
+        if not pairs:
+            raise TranslateError(f"model returned no translation for segment {only.id}")
+        return {only.id: pairs[0][1]}
+
+    mid = len(segments) // 2
+    left = _translate(backend, segments[:mid], before, after, system_prompt, dump_dir, dump_counter)
+    right = _translate(backend, segments[mid:], before, after, system_prompt, dump_dir, dump_counter)
+    return {**left, **right}
 
 
 def _request(
     backend: TranslateBackend,
     segments: list[TranslatedSegment],
-    context: list[TranslatedSegment],
-    source_window: list[TranslatedSegment],
+    before: list[TranslatedSegment],
+    after: list[TranslatedSegment],
     system_prompt: str,
     dump_dir: Path | None,
     dump_counter: "itertools.count[int]",
-) -> dict[int, str]:
+) -> list[tuple[int, str]]:
     payload = {
-        # Bare source-language text around the batch (no ids), so the model reads whole sentences —
-        # start and end — before translating; word order differs across languages.
-        "source_window": " ".join(segment.text.strip() for segment in source_window),
-        # Context is bare translated text (not structured), giving the model target-language
-        # continuity without inviting it to echo ids back.
-        "context": " ".join(segment.translated_text.strip() for segment in context if segment.translated_text),
+        # The only thing to translate and return, keyed by id.
         "translate": [{"id": segment.id, "text": segment.text} for segment in segments],
+        # Surrounding source-language text, kept separate from the batch so the model can read whole
+        # sentences (start and end) without mistaking this context for text it must translate.
+        "text_before": " ".join(segment.text.strip() for segment in before),
+        "text_after": " ".join(segment.text.strip() for segment in after),
+        # The target-language translation of `text_before`, for terminology and wording continuity.
+        "translated_before": " ".join(segment.translated_text.strip() for segment in before if segment.translated_text),
     }
     messages = [
         {"role": "system", "content": system_prompt},
@@ -340,9 +354,9 @@ def _request(
     except TranslateBackendError as e:
         _dump(dump_dir, dump_counter, segments, messages, error=str(e))
         raise
-    # Dump before parsing, so a parse failure (e.g. unknown ids) still leaves the exchange on disk.
+    # Dump before parsing, so an id mismatch that triggers a split still leaves the exchange on disk.
     _dump(dump_dir, dump_counter, segments, messages, content=result.content, finish_reason=result.finish_reason)
-    return _parse_response(result, {segment.id for segment in segments})
+    return _parse_response(result)
 
 
 def _returned_ids(content: str | None) -> list[int] | None:
@@ -369,7 +383,9 @@ def _dump(dump_dir, dump_counter, segments, messages, content=None, finish_reaso
     path.write_text(json.dumps(record, ensure_ascii=False, indent=2) + "\n")
 
 
-def _parse_response(result: ChatResult, requested_ids: set[int]) -> dict[int, str]:
+def _parse_response(result: ChatResult) -> list[tuple[int, str]]:
+    """Parse the reply into ordered (id, translated_text) pairs. Whether the ids match what was
+    requested is judged by `_translate` (a mismatch triggers a split), not here."""
     content = result.content
     if not content:
         raise TranslateError("translation response has no content")
@@ -377,13 +393,6 @@ def _parse_response(result: ChatResult, requested_ids: set[int]) -> dict[int, st
         raise TranslateError("translation response was cut off by the output token limit; try a smaller --batch-size")
     try:
         items = json.loads(content)["segments"]
-        translations = {int(item["id"]): str(item["translated_text"]) for item in items}
+        return [(int(item["id"]), str(item["translated_text"])) for item in items]
     except (json.JSONDecodeError, KeyError, TypeError, ValueError) as e:
         raise TranslateError(f"invalid translation response: {e}; content starts with {content[:120]!r}") from e
-    if len(translations) != len(items):
-        raise TranslateError("translation response contains duplicate segment ids")
-    unknown = sorted(set(translations) - requested_ids)
-    if unknown:
-        raise TranslateError(f"translation response contains unknown segment ids: {unknown}")
-    # Missing ids are not an error here: `_translate` re-requests the stragglers.
-    return translations

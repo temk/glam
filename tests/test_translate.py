@@ -145,7 +145,7 @@ def test_preserves_segment_ids_order_timestamps_and_count(tmp_path, patch_client
 def test_uses_translate_model_and_json_response_format(tmp_path, patch_client):
     calls = patch_client()
     _make_job(tmp_path)
-    translate_step.run("jobA", _config(tmp_path, model="llm-x"), echo=lambda *_: None)
+    translate_step.run("jobA", _config(tmp_path, model="llm-x"), echo=lambda *_: None, batch_size=2)
 
     assert len(calls) == 1
     assert calls[0]["model"] == "llm-x"
@@ -166,7 +166,7 @@ def test_glossary_terms_appear_in_prompt(tmp_path, patch_client):
 def test_empty_glossary_translates_normally(tmp_path, patch_client):
     calls = patch_client()
     _make_job(tmp_path, glossary={})
-    translate_step.run("jobA", _config(tmp_path), echo=lambda *_: None)
+    translate_step.run("jobA", _config(tmp_path), echo=lambda *_: None, batch_size=2)
 
     assert len(calls) == 1  # translation still runs
 
@@ -182,18 +182,18 @@ def test_batches_with_translated_context(tmp_path, patch_client):
 
     assert len(calls) == 3  # 10 + 10 + 5
     first = json.loads(calls[0]["messages"][1]["content"])
-    assert first["context"] == ""  # nothing precedes the first batch
+    assert first["translated_before"] == ""  # nothing precedes the first batch
     assert [s["id"] for s in first["translate"]] == list(range(10))
 
     second = json.loads(calls[1]["messages"][1]["content"])
-    assert second["context"] == "tr:s7 tr:s8 tr:s9"  # 3 preceding translations as plain text
+    assert second["translated_before"] == "tr:s7 tr:s8 tr:s9"  # 3 preceding translations as plain text
     assert [s["id"] for s in second["translate"]] == list(range(10, 20))
 
     assert len(data["segments"]) == 25
     assert all(s["translated_text"] for s in data["segments"])
 
 
-def test_source_window_spans_context_batch_and_lookahead(tmp_path, patch_client):
+def test_before_and_after_source_context_excludes_the_batch(tmp_path, patch_client):
     segments = [{"id": i, "start": float(i), "end": float(i) + 1, "text": f"s{i}"} for i in range(25)]
     transcript = {**TRANSCRIPT, "segments": segments}
     calls = patch_client()
@@ -202,18 +202,21 @@ def test_source_window_spans_context_batch_and_lookahead(tmp_path, patch_client)
     translate_step.run("jobA", _config(tmp_path), echo=lambda *_: None, batch_size=10, context_size=3, lookahead_size=2)
 
     first = json.loads(calls[0]["messages"][1]["content"])
-    # batch 0-9: no preceding segments, batch itself, plus 2 following (10, 11)
-    assert first["source_window"] == " ".join(f"s{i}" for i in range(12))
+    # batch 0-9: nothing before; 2 following (10, 11); the batch itself is only in 'translate'
+    assert first["text_before"] == ""
+    assert first["text_after"] == "s10 s11"
+    assert [s["id"] for s in first["translate"]] == list(range(10))
 
     second = json.loads(calls[1]["messages"][1]["content"])
-    # batch 10-19: 3 preceding (7-9), the batch, plus 2 following (20, 21)
-    assert second["source_window"] == " ".join(f"s{i}" for i in range(7, 22))
+    # batch 10-19: 3 preceding (7-9) before, 2 following (20, 21) after
+    assert second["text_before"] == "s7 s8 s9"
+    assert second["text_after"] == "s20 s21"
 
 
 def test_dump_writes_one_file_per_request(tmp_path, patch_client):
     patch_client()
     job_path = _make_job(tmp_path)
-    translate_step.run("jobA", _config(tmp_path), echo=lambda *_: None, dump=True)
+    translate_step.run("jobA", _config(tmp_path), echo=lambda *_: None, dump=True, batch_size=2)
 
     files = sorted((job_path / "translate.ru.dump").glob("*.json"))
     assert [p.name for p in files] == ["00001.json"]  # one request, one file
@@ -224,17 +227,18 @@ def test_dump_writes_one_file_per_request(tmp_path, patch_client):
     assert entry["response"]["content"] and entry["response"]["error"] is None
 
 
-def test_dump_records_unknown_ids_before_parse_fails(tmp_path, patch_client):
-    # Model returns an id that was never requested: parsing raises, but the dump must already exist.
+def test_dump_records_id_mismatch(tmp_path, patch_client):
+    # The model returns an id that was never requested; the run recovers by splitting, and the
+    # mismatched exchange is captured in the dump.
     patch_client(reply=_reply([{"id": 99, "translated_text": "x"}]))
     job_path = _make_job(tmp_path)
-    with pytest.raises(TranslateError, match="unknown segment ids"):
-        translate_step.run("jobA", _config(tmp_path), echo=lambda *_: None, dump=True)
+    translate_step.run("jobA", _config(tmp_path), echo=lambda *_: None, dump=True, batch_size=2)
 
     files = sorted((job_path / "translate.ru.dump").glob("*.json"))
-    assert files, "the exchange must be dumped before the parse failure"
-    entry = json.loads(files[0].read_text())
-    assert entry["returned_ids"] == [99]
+    first = json.loads(files[0].read_text())
+    assert first["requested_ids"] == [0, 1]
+    assert first["returned_ids"] == [99]  # the mismatch is recorded
+    assert len(files) >= 2  # the batch was split into per-segment retries
 
 
 def test_no_dump_dir_without_flag(tmp_path, patch_client):
@@ -280,26 +284,27 @@ def test_service_hooks_fire_on_run_but_not_on_skip(tmp_path, patch_client, monke
     assert hook_urls == []  # hooks do not fire on skip
 
 
-def test_retries_missing_segments(tmp_path, monkeypatch):
+def test_splits_and_recovers_on_id_mismatch(tmp_path, monkeypatch):
     _make_job(tmp_path)  # two segments, ids 0 and 1
     calls: list[dict] = []
 
     def create(**kwargs):
         calls.append(kwargs)
         ids = [s["id"] for s in json.loads(kwargs["messages"][1]["content"])["translate"]]
-        if len(calls) == 1:
-            ids = [i for i in ids if i != 1]  # first round drops one segment
+        if len(ids) > 1:
+            ids = ids[:1]  # the model merges the batch and returns only the first id (re-segmentation)
         content = _reply([{"id": i, "translated_text": f"tr{i}"} for i in ids])
         return SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(content=content))])
 
     client = SimpleNamespace(chat=SimpleNamespace(completions=SimpleNamespace(create=create)))
     monkeypatch.setattr("openai.OpenAI", lambda **kwargs: client)
 
-    path = translate_step.run("jobA", _config(tmp_path), echo=lambda *_: None)
+    path = translate_step.run("jobA", _config(tmp_path), echo=lambda *_: None, batch_size=2)
     data = json.loads(path.read_text())
 
-    assert len(calls) == 2  # the dropped segment triggered a second request
-    assert [s["id"] for s in json.loads(calls[1]["messages"][1]["content"])["translate"]] == [1]  # only the straggler
+    # [0,1] came back as just [0] -> ids untrustworthy -> split into [0] and [1], each returned cleanly
+    assert len(calls) == 3
+    assert [json.loads(c["messages"][1]["content"])["translate"][0]["id"] for c in calls] == [0, 0, 1]
     assert [s["translated_text"] for s in data["segments"]] == ["tr0", "tr1"]
 
 
@@ -339,7 +344,7 @@ def test_caches_each_segment_to_disk(tmp_path, patch_client):
 def test_resumes_from_cache_without_rerequesting(tmp_path, patch_client):
     calls = patch_client()
     _make_job(tmp_path)
-    out = translate_step.run("jobA", _config(tmp_path), echo=lambda *_: None)
+    out = translate_step.run("jobA", _config(tmp_path), echo=lambda *_: None, batch_size=2)
     assert len(calls) == 1  # first run made one request
 
     out.unlink()  # simulate a crash: cache is populated but the final file is gone
@@ -396,7 +401,7 @@ def test_force_recreates(tmp_path, patch_client):
     job_path = _make_job(tmp_path)
     (job_path / "translation.ru.json").write_text('{"existing": true}')
 
-    translate_step.run("jobA", _config(tmp_path), force=True, echo=lambda *_: None)
+    translate_step.run("jobA", _config(tmp_path), force=True, echo=lambda *_: None, batch_size=2)
 
     assert len(calls) == 1
     assert "segments" in json.loads((job_path / "translation.ru.json").read_text())
@@ -459,22 +464,9 @@ def test_invalid_backend_response_raises(tmp_path, patch_client):
         translate_step.run("jobA", _config(tmp_path), echo=lambda *_: None)
 
 
-def test_missing_segment_id_in_response_raises(tmp_path, patch_client):
-    patch_client(reply=_reply([{"id": 0, "translated_text": "Привет."}]))  # id 1 missing
+def test_single_segment_empty_response_raises(tmp_path, patch_client):
+    # An empty reply splits down to one segment, which the model still fails to translate.
+    patch_client(reply=_reply([]))
     _make_job(tmp_path)
-    with pytest.raises(TranslateError):
-        translate_step.run("jobA", _config(tmp_path), echo=lambda *_: None)
-
-
-def test_duplicate_segment_id_in_response_raises(tmp_path, patch_client):
-    patch_client(reply=_reply([{"id": 0, "translated_text": "a"}, {"id": 0, "translated_text": "b"}]))
-    _make_job(tmp_path)
-    with pytest.raises(TranslateError):
-        translate_step.run("jobA", _config(tmp_path), echo=lambda *_: None)
-
-
-def test_unknown_segment_id_in_response_raises(tmp_path, patch_client):
-    patch_client(reply=_reply([{"id": 0, "translated_text": "a"}, {"id": 99, "translated_text": "b"}]))
-    _make_job(tmp_path)
-    with pytest.raises(TranslateError):
+    with pytest.raises(TranslateError, match="no translation for segment"):
         translate_step.run("jobA", _config(tmp_path), echo=lambda *_: None)

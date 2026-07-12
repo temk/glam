@@ -27,11 +27,12 @@ uv run glam translate --job-id JOB_ID [--target LANG] [--config PATH] [--batch-s
 ```
 
 - `--target` — target language code, overriding the job's default target from `job.yaml`.
-- `--batch-size` — number of segments translated per model request (default: 30).
+- `--batch-size` — number of segments translated per model request (default: 1). One segment per
+  request keeps the id-to-text mapping unambiguous and is the only fully drift-proof case.
 - `--context-size` — number of already-translated preceding segments sent read-only with each
-  batch for continuity (default: 20).
-- `--lookahead-size` — number of following source segments appended to the source-language window so
-  the model can see how each sentence ends (default: 10).
+  batch for continuity (default: 5).
+- `--lookahead-size` — number of following source segments given as read-only context so
+  the model can see how each sentence ends (default: 2).
 - `--start` — resume from the N-th segment (1-based); earlier segments are taken from the cache
   (see "Caching and resume").
 - `--dump` — write each model request/response exchange to its own file under
@@ -86,8 +87,8 @@ The cache is keyed by target language (and the zero-padded segment id), so sever
 in one job without clashing.
 
 On each run the step first fills in every segment already present in the cache, then translates only
-the remaining segments (batched, with the usual `context` from preceding translations — which may be
-cached ones). This makes a rerun resume automatically: only the missing segments are sent to the
+the remaining segments (batched, with the usual `translated_before` continuity from preceding
+translations — which may be cached ones). This makes a rerun resume automatically: only the missing segments are sent to the
 model. `--force` re-translates every segment, ignoring the cache.
 
 `--start N` begins at the N-th segment (1-based, matching the progress counter). Segments before N are
@@ -135,20 +136,25 @@ If `glossary.json` is missing or has an invalid format, this is an input error f
 
 ## Model request behavior
 
-The step translates segments in batches of `--batch-size` (default 30).
+The step translates segments in batches of `--batch-size` (default 1 — one segment per request, which
+is drift-proof; larger batches are faster but rely on the model keeping the id-to-text mapping).
 
-Each batch request carries a JSON object with three fields:
+Each batch request carries a JSON object with four fields. The surrounding context is kept **separate**
+from the batch — never glued into one blob — so the model can tell exactly which text it must translate
+and which is only there for understanding:
 
-- `translate` — the segments to translate, as an array of `{id, text}`;
-- `context` — the already-translated target-language text of up to `--context-size` (default 20)
-  preceding segments, as a single plain-text string (the joined `translated_text`, without ids).
-  It is sent read-only so the model keeps terminology and wording consistent across batch
-  boundaries. The model must not translate or return the context.
-- `source_window` — the source-language text around the batch as a single plain-text string (the
-  joined `text`, without ids): the same preceding segments as `context`, the batch itself, and up to
-  `--lookahead-size` (default 10) following segments. It lets the model read whole sentences — both
-  their start and their end — before translating, which matters when word order differs between the
-  languages. It is sent read-only; the model must not translate or return it.
+- `translate` — the segments to translate, as an array of `{id, text}`. This is the only text to
+  translate and return.
+- `text_before` — the source-language text of up to `--context-size` (default 5) segments immediately
+  **before** the batch, as a single plain-text string (joined `text`, no ids). Reference only.
+- `text_after` — the source-language text of up to `--lookahead-size` (default 2) segments immediately
+  **after** the batch, joined the same way. It lets the model see how a sentence ends before
+  translating its start, which matters when word order differs between the languages. Reference only.
+- `translated_before` — the target-language translation of `text_before` (the same preceding segments,
+  already translated), for terminology and wording continuity across batch boundaries. Reference only.
+
+The three reference fields are read-only: the model must not translate or return them, and must not
+fold their words into a segment's translation.
 
 The request asks the model for a structured response that can be validated. The step uses
 OpenAI-compatible structured outputs (a strict JSON schema), so backends that honor it (Ollama,
@@ -158,15 +164,17 @@ The prompt must instruct the model to translate every requested segment: exactly
 the same number of entries as the input, without skipping, merging, splitting, reordering, adding,
 or dropping segments.
 
-The step must validate every response before writing `translation.<target>.json`:
+Each response must be well-formed and match the expected shape (a JSON object with a `segments` array
+of `{id, translated_text}`); an unparseable or truncated response is an error.
 
-- the response is well-formed and matches the expected shape;
-- returned ids are a subset of the requested ids (unknown ids are an error);
-- there are no duplicate ids.
-
-Weak models sometimes drop a few segments from a large batch. The step re-requests only the missing
-ids, up to a fixed number of rounds. If segments are still missing after the final round, this is an
-error suggesting a smaller `--batch-size`.
+The returned ids, however, cannot be trusted blindly. Weak models re-segment — they merge or split
+fragments and renumber their outputs `0, 1, 2, …`, so the ids stop labelling the requested segments
+and translations would be assigned to the wrong ones. The step therefore trusts a reply's ids only
+when they are **exactly** the requested ids (same set, no missing, extra, or duplicate). When they are
+not, the batch is **split in half and each half retried**, recursively, down to a single segment —
+whose lone translation is taken by position, ignoring whatever id the model attached (the only case
+with no alignment ambiguity). A single segment the model still fails to translate (an empty reply) is
+an error.
 
 Translation quality depends on the configured model; small models may still produce imperfect text
 that a schema cannot fix.
@@ -205,7 +213,7 @@ Expected errors:
 - translation service unavailable;
 - translation service returned an invalid response;
 - translation response was truncated by the model's output token limit;
-- the model did not translate all segments (missing segment IDs) after all retry rounds;
+- the model failed to translate a single segment even after the batch was split down to it;
 - `--start` refers to a position whose earlier segments are not cached;
 - unable to write the translation or cache a segment.
 
@@ -237,10 +245,11 @@ Tests for `translate` must cover:
 - handling an invalid transcript format;
 - handling an unavailable backend;
 - handling an invalid backend response;
-- handling a backend response with missing, duplicate, or unknown segment IDs;
+- trusting a reply only on an exact id match, and splitting the batch to recover when ids mismatch;
+- assigning the lone translation by position once a batch is split to a single segment;
+- erroring when a single segment still comes back empty after splitting;
 - translating in batches of `--batch-size`;
-- sending preceding translations as `context` for continuity;
-- recovering segments the model drops from a batch by re-requesting them;
+- sending preceding translations as `translated_before` for continuity;
 - printing per-batch progress;
 - caching each translated segment under `translate/`;
 - resuming from the cache without re-requesting (e.g. after the final file is lost);

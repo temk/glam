@@ -111,15 +111,15 @@ def transcribe_cmd(job_id, config_path, force):
 @job_id_option
 @target_option
 @config_option
-@click.option("--batch-size", type=int, default=None, help="Segments translated per request (default: 30)")
+@click.option("--batch-size", type=int, default=None, help="Segments translated per request (default: 1)")
 @click.option(
-    "--context-size", type=int, default=None, help="Preceding translated segments sent for context (default: 20)"
+    "--context-size", type=int, default=None, help="Preceding translated segments sent for context (default: 5)"
 )
 @click.option(
     "--lookahead-size",
     type=int,
     default=None,
-    help="Following source segments added to the source-language window for sentence endings (default: 10)",
+    help="Following source segments given as context for sentence endings (default: 2)",
 )
 @click.option(
     "--start",
