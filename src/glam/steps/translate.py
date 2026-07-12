@@ -7,6 +7,7 @@ from datetime import datetime
 from dataclasses import asdict, dataclass
 
 from glam.common.job import JOB_MANIFEST_NAME, read_job_manifest
+from glam.common.hooks import service_hooks
 from glam.common.config import Config, ServiceName, ServiceConfig
 from glam.common.errors import GlamError
 from glam.common.translation import translation_filename
@@ -126,24 +127,25 @@ def run(
 
     service = config[ServiceName.TRANSLATE]
     dump_dir = job_path / DUMP_DIR_TEMPLATE.format(target) if dump else None
-    _apply_translations(
-        translation,
-        manifest.languages.source,
-        target,
-        glossary,
-        service,
-        echo,
-        batch_size,
-        context_size,
-        lookahead_size,
-        job_path / TRANSLATE_CACHE_DIRNAME,
-        target,
-        force,
-        start,
-        dump_dir,
-    )
+    with service_hooks(service.hooks, echo):
+        _apply_translations(
+            translation,
+            manifest.languages.source,
+            target,
+            glossary,
+            service,
+            echo,
+            batch_size,
+            context_size,
+            lookahead_size,
+            job_path / TRANSLATE_CACHE_DIRNAME,
+            target,
+            force,
+            start,
+            dump_dir,
+        )
+        translation_path.write_text(json.dumps(asdict(translation), ensure_ascii=False, indent=2) + "\n")
 
-    translation_path.write_text(json.dumps(asdict(translation), ensure_ascii=False, indent=2) + "\n")
     echo(f"wrote {translation_path} ({len(translation.segments)} segments)")
     return translation_path
 

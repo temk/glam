@@ -289,6 +289,13 @@ services:
     params:
       model: some-llm-model
       api_key: SECRET
+    hooks:
+      pre:
+        url: http://host:9090/v1/actions/prepare-translate
+        timeout: 120
+      post:
+        url: http://host:9090/v1/actions/release-translate
+        timeout: 60
 
   - name: tts
     protocol: chatterbox
@@ -323,6 +330,19 @@ The shared config loader validates only the common part and keeps `params` as a 
 
 - `openai` — `params.model` (model name); `params.api_key` (optional API key; real keys belong only in local, uncommitted config files); for `tts`, an optional default `params.voice` (the OpenAI speech protocol requires a voice, so this or a per-run `--voice` must be set). The `url` points at the OpenAI-compatible base (usually ending in `/v1`).
 - `chatterbox` (`tts` only) — the `url` points at the server root; the native `/tts` endpoint is appended by the backend. `params` may be empty; the server requires a predefined voice, so when none is resolved the backend falls back to a built-in default voice.
+
+#### `hooks`
+
+A service may declare optional `hooks` — side-effect HTTP calls around the step that owns the service, for example loading a model onto the GPU before the step and releasing it after. The section is meant for the three remote steps (`transcribe`, `translate`, `tts`).
+
+- `hooks` is optional. When present it must define at least one of `pre` / `post` (an empty section is rejected).
+- each of `pre` / `post` has a required `url`, an optional `method` (default `POST`), and an optional `timeout` in seconds (default `180`).
+
+Semantics:
+
+- `pre` runs once, only when the step actually does work — a step skipped because its output already exists never fires hooks. A failed `pre` aborts the step (and `post` is not run, since the step never started).
+- `post` runs once in a `finally`, so it fires even when the step raised. A failed `post` is itself a step failure: it propagates when the step's own work succeeded, and when the work already failed the original error stays primary while the `post` failure is logged (a failure in `finally` never masks the real cause).
+- hooks fire once per step, not once per batch.
 
 Step-specific tuning does not belong to the config file; it lives in CLI options, job-local files such as `job.yaml` and `glossary.json`, and constants of the corresponding step module.
 

@@ -1,7 +1,7 @@
 import pytest
 from pathlib import Path
 
-from glam.common.config import Protocol, ConfigError, ServiceName, read_config
+from glam.common.config import DEFAULT_HOOK_TIMEOUT, Protocol, ConfigError, ServiceName, read_config
 
 VALID_CONFIG = """
 job_dir: /tmp/jobs
@@ -44,6 +44,48 @@ def test_config_parses_valid_file(tmp_path):
     tts = config["tts"]
     assert tts.protocol is Protocol.CHATTERBOX
     assert tts.params == {}  # protocol-specific bag defaults to empty
+
+
+def test_hooks_parsed_with_defaults(tmp_path):
+    text = (
+        "services:\n"
+        "  - name: translate\n"
+        "    protocol: openai\n"
+        "    url: http://h/v1\n"
+        "    hooks:\n"
+        "      pre:\n"
+        "        url: http://h:9090/prepare\n"
+        "        timeout: 120\n"
+        "      post:\n"
+        "        url: http://h:9090/release\n"
+    )
+    config = read_config(_write(tmp_path, text))
+    hooks = config["translate"].hooks
+
+    assert hooks is not None
+    assert hooks.pre.url == "http://h:9090/prepare"
+    assert hooks.pre.method == "POST"  # default method
+    assert hooks.pre.timeout == 120
+    assert hooks.post.method == "POST"
+    assert hooks.post.timeout == DEFAULT_HOOK_TIMEOUT  # default timeout
+
+
+def test_hooks_absent_is_none(tmp_path):
+    assert read_config(_write(tmp_path, VALID_CONFIG))["translate"].hooks is None
+
+
+def test_empty_hooks_section_rejected(tmp_path):
+    text = "services:\n  - name: tts\n    protocol: chatterbox\n    url: u\n    hooks: {}\n"
+    with pytest.raises(ConfigError, match="at least one of 'pre'/'post'"):
+        read_config(_write(tmp_path, text))
+
+
+def test_hook_without_url_rejected(tmp_path):
+    text = (
+        "services:\n  - name: tts\n    protocol: chatterbox\n    url: u\n    hooks:\n      pre:\n        timeout: 30\n"
+    )
+    with pytest.raises(ConfigError):
+        read_config(_write(tmp_path, text))
 
 
 def test_job_dir_expands_user(tmp_path):

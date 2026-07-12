@@ -5,6 +5,7 @@ from datetime import datetime
 from dataclasses import dataclass
 
 from glam.common.job import JOB_MANIFEST_NAME, read_job_manifest
+from glam.common.hooks import service_hooks
 from glam.common.config import Config, ServiceName, ServiceConfig
 from glam.common.errors import GlamError
 from glam.backend.tts.base import build_tts_backend
@@ -74,8 +75,9 @@ def run(
     service = config[ServiceName.TTS]
     cache_dir = job_path / TTS_CACHE_DIRNAME
     cache_key = f"{target}.{voice}" if voice else target
-    fragments = _synthesize(segments, service, target, voice, cache_dir, cache_key, force, start, echo)
-    _assemble(output_path, segments, fragments)
+    with service_hooks(service.hooks, echo):
+        fragments = _synthesize(segments, service, target, voice, cache_dir, cache_key, force, start, echo)
+        _assemble(output_path, segments, fragments)
 
     echo(f"wrote {output_path} ({len(segments)} segments)")
     return output_path

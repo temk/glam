@@ -10,6 +10,7 @@ from glam.common.errors import GlamError
 
 DEFAULT_CONFIG_PATH = "~/.glam.yaml"
 DEFAULT_JOBS_PATH = "/tmp/glam_jobs"
+DEFAULT_HOOK_TIMEOUT = 180  # seconds; 3 minutes
 
 
 class ServiceName(str, Enum):
@@ -32,12 +33,29 @@ class ConfigError(GlamError):
 
 
 @dataclass
+class HookConfig:
+    url: str
+    method: str = "POST"
+    timeout: int = DEFAULT_HOOK_TIMEOUT
+
+
+@dataclass
+class ServiceHooks:
+    """Optional side-effect calls around a step (e.g. load/unload a GPU model). At least one of
+    `pre`/`post` must be set, else the section is pointless (validated in `read_config`)."""
+
+    pre: HookConfig | None = None
+    post: HookConfig | None = None
+
+
+@dataclass
 class ServiceConfig:
     name: ServiceName
     protocol: Protocol
     url: str
     # Protocol-specific fields, kept opaque here; each backend deserializes them into its own config.
     params: dict = field(default_factory=dict)
+    hooks: ServiceHooks | None = None
 
 
 @dataclass
@@ -77,6 +95,14 @@ def read_config(path: str | Path) -> Config:
         raise ConfigError(f"config file not found: {path}") from None
     try:
         data = yaml.safe_load(text) or {}
-        return dacite.from_dict(data_class=Config, data=data, config=_DACITE)
+        config = dacite.from_dict(data_class=Config, data=data, config=_DACITE)
     except (yaml.YAMLError, dacite.DaciteError, ValueError, TypeError) as e:
         raise ConfigError(f"invalid config file {path}: {e}") from e
+    _validate_hooks(config)
+    return config
+
+
+def _validate_hooks(config: Config) -> None:
+    for service in config.services:
+        if service.hooks is not None and service.hooks.pre is None and service.hooks.post is None:
+            raise ConfigError(f"service '{service.name.value}': 'hooks' must define at least one of 'pre'/'post'")

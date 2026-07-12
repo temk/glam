@@ -6,7 +6,7 @@ from pathlib import Path
 
 from glam.steps import translate as translate_step
 from glam.common.job import JobInfo, Languages, SourceInfo, JobManifest, write_job_manifest
-from glam.common.config import Config, Protocol, ConfigError, ServiceName, ServiceConfig
+from glam.common.config import Config, Protocol, HookConfig, ConfigError, ServiceName, ServiceHooks, ServiceConfig
 from glam.steps.translate import TranslateError
 from glam.backend.translate.base import TranslateBackendError
 
@@ -243,6 +243,41 @@ def test_no_dump_dir_without_flag(tmp_path, patch_client):
     translate_step.run("jobA", _config(tmp_path), echo=lambda *_: None)
 
     assert not (job_path / "translate.ru.dump").exists()
+
+
+class _FakeHookResponse:
+    status = 200
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+
+def test_service_hooks_fire_on_run_but_not_on_skip(tmp_path, patch_client, monkeypatch):
+    patch_client()
+    _make_job(tmp_path)
+    hook_urls: list[str] = []
+    monkeypatch.setattr(
+        "urllib.request.urlopen",
+        lambda request, timeout: (hook_urls.append(request.full_url), _FakeHookResponse())[1],
+    )
+    service = ServiceConfig(
+        name=ServiceName.TRANSLATE,
+        protocol=Protocol.OPENAI,
+        url="http://llm/v1",
+        params={"model": "m"},
+        hooks=ServiceHooks(pre=HookConfig(url="http://h/pre"), post=HookConfig(url="http://h/post")),
+    )
+    config = Config(services=[service], job_dir=tmp_path)
+
+    translate_step.run("jobA", config, echo=lambda *_: None)
+    assert hook_urls == ["http://h/pre", "http://h/post"]  # pre before work, post after
+
+    hook_urls.clear()
+    translate_step.run("jobA", config, echo=lambda *_: None)  # output exists now -> skip
+    assert hook_urls == []  # hooks do not fire on skip
 
 
 def test_retries_missing_segments(tmp_path, monkeypatch):

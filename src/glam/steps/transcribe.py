@@ -5,6 +5,7 @@ from pathlib import Path
 from dataclasses import asdict, dataclass
 
 from glam.common.job import JOB_MANIFEST_NAME, JobManifest, read_job_manifest
+from glam.common.hooks import service_hooks
 from glam.common.config import Config, ServiceName
 from glam.common.errors import GlamError
 from glam.transcript_merge import merge_sentences
@@ -51,24 +52,29 @@ def run(job_id: str, config: Config, force: bool = False, echo=print) -> Path:
         echo(f"skip transcript, already exists: {transcript_path}")
         return transcript_path
 
-    raw = _obtain_raw(job_id, job_path, manifest, config, force, echo)
+    # Look up the service's hooks without requiring the service itself: re-cleaning from a cached
+    # transcript.raw.json needs no ASR service, and `_obtain_raw` still raises if it is absent when ASR
+    # is actually needed.
+    service = next((s for s in config.services if s.name == ServiceName.TRANSCRIBE), None)
+    with service_hooks(service.hooks if service is not None else None, echo):
+        raw = _obtain_raw(job_id, job_path, manifest, config, force, echo)
 
-    # transcript.json is healed in two passes: clean the raw segments, then merge the survivors into
-    # sentence-level units (each keeps its source ids). Serialize the raw's top-level fields, then swap
-    # in the merged segments, whose `source_ids` field the raw AsrSegment schema does not carry.
-    result = clean_segments(raw.segments)
-    merged = merge_sentences(result.segments)
-    document = asdict(raw)
-    document["segments"] = [asdict(segment) for segment in merged]
-    transcript_path.write_text(json.dumps(document, ensure_ascii=False, indent=2) + "\n")
+        # transcript.json is healed in two passes: clean the raw segments, then merge the survivors into
+        # sentence-level units (each keeps its source ids). Serialize the raw's top-level fields, then swap
+        # in the merged segments, whose `source_ids` field the raw AsrSegment schema does not carry.
+        result = clean_segments(raw.segments)
+        merged = merge_sentences(result.segments)
+        document = asdict(raw)
+        document["segments"] = [asdict(segment) for segment in merged]
+        transcript_path.write_text(json.dumps(document, ensure_ascii=False, indent=2) + "\n")
 
-    cleanup = {
-        "version": TRANSCRIPT_VERSION,
-        "step": "transcribe",
-        "job_id": job_id,
-        "warnings": [asdict(w) for w in result.warnings],
-    }
-    (job_path / CLEANUP_NAME).write_text(json.dumps(cleanup, ensure_ascii=False, indent=2) + "\n")
+        cleanup = {
+            "version": TRANSCRIPT_VERSION,
+            "step": "transcribe",
+            "job_id": job_id,
+            "warnings": [asdict(w) for w in result.warnings],
+        }
+        (job_path / CLEANUP_NAME).write_text(json.dumps(cleanup, ensure_ascii=False, indent=2) + "\n")
 
     echo(
         f"wrote {transcript_path} ({len(merged)} segments from {len(result.segments)} cleaned, "
