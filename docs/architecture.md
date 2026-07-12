@@ -34,7 +34,7 @@ Step roles in brief:
 | Step | Purpose |
 |---|---|
 | `init` | Registers a job, creates the job directory, writes the job manifest and glossary, and prepares initial local artifacts. |
-| `transcribe` | Produces a transcript and timestamps through an ASR backend. |
+| `transcribe` | Produces a transcript and timestamps through an ASR backend, then heals the raw result — cleaning artifacts and merging fragments into sentence units — into `transcript.json` and records a cleanup report. |
 | `translate` | Translates the transcript through an LLM backend while applying glossary rules. |
 | `subtitles` | Creates a subtitle file from translated segments. |
 | `accent` | Applies per-language text fixes (e.g. Russian stress marks) into `translation.<target>.fixed.json`. |

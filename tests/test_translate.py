@@ -193,6 +193,58 @@ def test_batches_with_translated_context(tmp_path, patch_client):
     assert all(s["translated_text"] for s in data["segments"])
 
 
+def test_source_window_spans_context_batch_and_lookahead(tmp_path, patch_client):
+    segments = [{"id": i, "start": float(i), "end": float(i) + 1, "text": f"s{i}"} for i in range(25)]
+    transcript = {**TRANSCRIPT, "segments": segments}
+    calls = patch_client()
+    _make_job(tmp_path, transcript=transcript)
+
+    translate_step.run("jobA", _config(tmp_path), echo=lambda *_: None, batch_size=10, context_size=3, lookahead_size=2)
+
+    first = json.loads(calls[0]["messages"][1]["content"])
+    # batch 0-9: no preceding segments, batch itself, plus 2 following (10, 11)
+    assert first["source_window"] == " ".join(f"s{i}" for i in range(12))
+
+    second = json.loads(calls[1]["messages"][1]["content"])
+    # batch 10-19: 3 preceding (7-9), the batch, plus 2 following (20, 21)
+    assert second["source_window"] == " ".join(f"s{i}" for i in range(7, 22))
+
+
+def test_dump_writes_one_file_per_request(tmp_path, patch_client):
+    patch_client()
+    job_path = _make_job(tmp_path)
+    translate_step.run("jobA", _config(tmp_path), echo=lambda *_: None, dump=True)
+
+    files = sorted((job_path / "translate.ru.dump").glob("*.json"))
+    assert [p.name for p in files] == ["00001.json"]  # one request, one file
+    entry = json.loads(files[0].read_text())
+    assert entry["requested_ids"] == [0, 1]
+    assert entry["returned_ids"] == [0, 1]  # the model echoed the requested ids back
+    assert entry["request"]["messages"][1]["role"] == "user"
+    assert entry["response"]["content"] and entry["response"]["error"] is None
+
+
+def test_dump_records_unknown_ids_before_parse_fails(tmp_path, patch_client):
+    # Model returns an id that was never requested: parsing raises, but the dump must already exist.
+    patch_client(reply=_reply([{"id": 99, "translated_text": "x"}]))
+    job_path = _make_job(tmp_path)
+    with pytest.raises(TranslateError, match="unknown segment ids"):
+        translate_step.run("jobA", _config(tmp_path), echo=lambda *_: None, dump=True)
+
+    files = sorted((job_path / "translate.ru.dump").glob("*.json"))
+    assert files, "the exchange must be dumped before the parse failure"
+    entry = json.loads(files[0].read_text())
+    assert entry["returned_ids"] == [99]
+
+
+def test_no_dump_dir_without_flag(tmp_path, patch_client):
+    patch_client()
+    job_path = _make_job(tmp_path)
+    translate_step.run("jobA", _config(tmp_path), echo=lambda *_: None)
+
+    assert not (job_path / "translate.ru.dump").exists()
+
+
 def test_retries_missing_segments(tmp_path, monkeypatch):
     _make_job(tmp_path)  # two segments, ids 0 and 1
     calls: list[dict] = []

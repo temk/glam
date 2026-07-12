@@ -86,7 +86,42 @@ def test_creates_transcript(tmp_path, patch_client):
     assert data["source_language"] == "en"
     assert data["model"] == "whisper-x"
     assert data["audio_artifact"] == "audio.wav"
-    assert data["segments"] == DEFAULT_SEGMENTS
+    # Already clean and each sentence ends on its own, so nothing merges: same segments plus source_ids.
+    assert data["segments"] == [
+        {"id": 0, "start": 0.0, "end": 1.5, "text": "Hello.", "source_ids": [0]},
+        {"id": 1, "start": 1.5, "end": 3.0, "text": "World.", "source_ids": [1]},
+    ]
+
+    job_path = path.parent
+    raw = json.loads((job_path / "transcript.raw.json").read_text())
+    assert raw["segments"] == DEFAULT_SEGMENTS
+    cleanup = json.loads((job_path / "transcript.cleanup.json").read_text())
+    assert cleanup["step"] == "transcribe"
+    assert cleanup["warnings"] == []
+
+
+def test_heals_dirty_segments(tmp_path, patch_client):
+    dirty = [
+        {"id": 0, "start": 0.0, "end": 1.0, "text": "Intro."},
+        {"id": 1, "start": 1.0, "end": 1.1, "text": "."},
+        {"id": 2, "start": 1.1, "end": 2.0, "text": "The quick"},
+        {"id": 3, "start": 2.0, "end": 3.0, "text": "The quick brown fox"},
+    ]
+    patch_client(segments=dirty)
+    _make_job(tmp_path)
+    path = transcribe_step.run("jobA", _config(tmp_path), echo=lambda *_: None)
+
+    data = json.loads(path.read_text())
+    assert [s["text"] for s in data["segments"]] == ["Intro.", "The quick brown fox"]
+    assert [s["id"] for s in data["segments"]] == [0, 1]  # renumbered
+
+    job_path = path.parent
+    raw = json.loads((job_path / "transcript.raw.json").read_text())
+    assert raw["segments"] == dirty  # raw is preserved untouched
+    cleanup = json.loads((job_path / "transcript.cleanup.json").read_text())
+    rules = [w["rule"] for w in cleanup["warnings"]]
+    assert rules == ["punctuation_only", "repeat_continuation"]
+    assert [w["segment_id"] for w in cleanup["warnings"]] == [1, 2]
 
 
 def test_requests_verbose_segments_in_source_language(tmp_path, patch_client):
@@ -121,6 +156,47 @@ def test_force_recreates(tmp_path, patch_client):
     transcribe_step.run("jobA", _config(tmp_path), force=True, echo=lambda *_: None)
 
     assert len(calls) == 1
+
+
+def _raw_transcript(segments: list[dict]) -> dict:
+    return {
+        "version": 1,
+        "step": "transcribe",
+        "job_id": "jobA",
+        "source_language": "en",
+        "model": "whisper-x",
+        "audio_artifact": "audio.wav",
+        "segments": segments,
+    }
+
+
+def test_reuses_cached_raw_without_asr(tmp_path, patch_client):
+    calls = patch_client()
+    job_path = _make_job(tmp_path)
+    dirty = [
+        {"id": 0, "start": 0.0, "end": 1.0, "text": "Cached."},
+        {"id": 1, "start": 1.0, "end": 1.1, "text": "."},
+    ]
+    (job_path / "transcript.raw.json").write_text(json.dumps(_raw_transcript(dirty)))
+
+    path = transcribe_step.run("jobA", _config(tmp_path), echo=lambda *_: None)
+
+    assert calls == []  # raw was reused, so the ASR service was not called
+    data = json.loads(path.read_text())
+    assert [s["text"] for s in data["segments"]] == ["Cached."]  # cleaned from the cached raw
+    assert data["model"] == "whisper-x"  # top-level fields carried over from the raw transcript
+    assert json.loads((job_path / "transcript.raw.json").read_text())["segments"] == dirty  # raw untouched
+
+
+def test_force_reruns_asr_even_with_cached_raw(tmp_path, patch_client):
+    calls = patch_client()
+    job_path = _make_job(tmp_path)
+    (job_path / "transcript.raw.json").write_text(json.dumps(_raw_transcript([])))
+
+    transcribe_step.run("jobA", _config(tmp_path), force=True, echo=lambda *_: None)
+
+    assert len(calls) == 1  # --force ignores the cached raw
+    assert json.loads((job_path / "transcript.raw.json").read_text())["segments"] == DEFAULT_SEGMENTS
     assert json.loads((job_path / "transcript.json").read_text())["step"] == "transcribe"
 
 

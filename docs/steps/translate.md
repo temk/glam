@@ -23,15 +23,19 @@ The step runs local pipeline code, but the translation model is called through a
 ## CLI
 
 ```bash
-uv run glam translate --job-id JOB_ID [--target LANG] [--config PATH] [--batch-size N] [--context-size N] [--start N] [--force]
+uv run glam translate --job-id JOB_ID [--target LANG] [--config PATH] [--batch-size N] [--context-size N] [--lookahead-size N] [--start N] [--dump] [--force]
 ```
 
 - `--target` — target language code, overriding the job's default target from `job.yaml`.
-- `--batch-size` — number of segments translated per model request (default: 100).
+- `--batch-size` — number of segments translated per model request (default: 30).
 - `--context-size` — number of already-translated preceding segments sent read-only with each
-  batch for continuity (default: 100).
+  batch for continuity (default: 20).
+- `--lookahead-size` — number of following source segments appended to the source-language window so
+  the model can see how each sentence ends (default: 10).
 - `--start` — resume from the N-th segment (1-based); earlier segments are taken from the cache
   (see "Caching and resume").
+- `--dump` — write each model request/response exchange to its own file under
+  `translate.<target>.dump/` for debugging (see "Debug dump").
 
 The CLI is defined in `src/glam/cli.py`.
 
@@ -94,6 +98,23 @@ earlier cached segments.
 Unlike a plain run, passing `--force` or `--start` runs even when `translation.<target>.json` already
 exists.
 
+## Debug dump
+
+`--dump` writes each model request/response exchange to its own file in a per-language folder,
+numbered in request order (each retry round is its own request, hence its own file):
+
+```text
+<job_dir>/<job-id>/translate.<target>.dump/<nnnnn>.json
+```
+
+Each file records the requested ids, the ids the model actually returned (best effort — `null` when
+the response is unparseable), the full request messages, and the response content, finish reason, or
+backend error. A file is written **before** its response is parsed, so an exchange that fails
+validation (for example unknown segment ids) still leaves its file on disk. The folder is created at
+the start of a dumping run and cleared of stale files so it reflects only the current run.
+
+Dump files are debug artifacts, not pipeline inputs: no downstream step reads them.
+
 ## Segment preservation
 
 `translate` must preserve the segmentation from `transcript.json`.
@@ -114,15 +135,20 @@ If `glossary.json` is missing or has an invalid format, this is an input error f
 
 ## Model request behavior
 
-The step translates segments in batches of `--batch-size` (default 100).
+The step translates segments in batches of `--batch-size` (default 30).
 
-Each batch request carries a JSON object with two fields:
+Each batch request carries a JSON object with three fields:
 
 - `translate` — the segments to translate, as an array of `{id, text}`;
-- `context` — the already-translated target-language text of up to `--context-size` (default 100)
+- `context` — the already-translated target-language text of up to `--context-size` (default 20)
   preceding segments, as a single plain-text string (the joined `translated_text`, without ids).
   It is sent read-only so the model keeps terminology and wording consistent across batch
   boundaries. The model must not translate or return the context.
+- `source_window` — the source-language text around the batch as a single plain-text string (the
+  joined `text`, without ids): the same preceding segments as `context`, the batch itself, and up to
+  `--lookahead-size` (default 10) following segments. It lets the model read whole sentences — both
+  their start and their end — before translating, which matters when word order differs between the
+  languages. It is sent read-only; the model must not translate or return it.
 
 The request asks the model for a structured response that can be validated. The step uses
 OpenAI-compatible structured outputs (a strict JSON schema), so backends that honor it (Ollama,
@@ -151,7 +177,8 @@ that a schema cannot fix.
 
 ```text
 translation.<target>.json
-translate/               # per-segment translation cache (see "Caching and resume")
+translate/                # per-segment translation cache (see "Caching and resume")
+translate.<target>.dump/  # optional per-request debug dump written only with --dump (see "Debug dump")
 ```
 
 It does not modify artifacts owned by other steps.

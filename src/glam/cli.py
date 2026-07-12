@@ -111,9 +111,15 @@ def transcribe_cmd(job_id, config_path, force):
 @job_id_option
 @target_option
 @config_option
-@click.option("--batch-size", type=int, default=None, help="Segments translated per request (default: 100)")
+@click.option("--batch-size", type=int, default=None, help="Segments translated per request (default: 30)")
 @click.option(
-    "--context-size", type=int, default=None, help="Preceding translated segments sent for context (default: 100)"
+    "--context-size", type=int, default=None, help="Preceding translated segments sent for context (default: 20)"
+)
+@click.option(
+    "--lookahead-size",
+    type=int,
+    default=None,
+    help="Following source segments added to the source-language window for sentence endings (default: 10)",
 )
 @click.option(
     "--start",
@@ -121,18 +127,28 @@ def transcribe_cmd(job_id, config_path, force):
     default=None,
     help="Resume from this segment number (1-based); earlier segments are taken from the on-disk cache",
 )
+@click.option(
+    "--dump",
+    is_flag=True,
+    default=False,
+    help="Dump each request/response exchange into its own file under translate.<lang>.dump/ for debugging",
+)
 @click.option("--force", is_flag=True, help="Re-translate every segment even if cached")
 @handle_glam_errors
-def translate_cmd(job_id, target, config_path, batch_size, context_size, start, force):
+def translate_cmd(job_id, target, config_path, batch_size, context_size, lookahead_size, dump, start, force):
     """Translate a job's transcript through the configured LLM service."""
     # Imported here, not at module top, so `--help` and local commands do not pull in
     # the OpenAI SDK. See docs/architecture.md "CLI layout".
     from glam.steps import translate as translate_step
 
     # Only forward the tuning options when set, so the step keeps its own defaults.
-    tuning = {k: v for k, v in {"batch_size": batch_size, "context_size": context_size}.items() if v is not None}
+    tuning = {
+        k: v
+        for k, v in {"batch_size": batch_size, "context_size": context_size, "lookahead_size": lookahead_size}.items()
+        if v is not None
+    }
     config = read_config(config_path)
-    translate_step.run(job_id, config, target=target, force=force, echo=click.echo, start=start, **tuning)
+    translate_step.run(job_id, config, target=target, force=force, echo=click.echo, start=start, dump=dump, **tuning)
 
 
 @main.command("subtitles")
