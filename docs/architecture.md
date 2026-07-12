@@ -11,7 +11,6 @@ Details for specific steps should live in separate files:
 - `docs/steps/accent.md`
 - `docs/steps/tts.md`
 - `docs/steps/mux.md`
-- `docs/steps/run.md`
 
 ## Pipeline steps
 
@@ -25,9 +24,8 @@ init → transcribe → translate → subtitles → accent → tts → mux
 stress marks) and only produces output for those languages. `subtitles` and `accent` both consume
 `translate`'s output and are independent of each other.
 
-`run` is an orchestration command that executes these steps in sequence and skips artifacts that already exist.
-
-`run` must not implement the internal logic of individual steps. It only determines execution order, passes shared parameters, invokes steps in the correct sequence, and respects idempotency/`--force`.
+Each step is a separate CLI command; running the full pipeline end-to-end is done by an external shell
+script that invokes the steps in order, not by a built-in command.
 
 Step roles in brief:
 
@@ -40,7 +38,6 @@ Step roles in brief:
 | `accent` | Applies per-language text fixes (e.g. Russian stress marks) into `translation.<target>.fixed.json`. |
 | `tts` | Creates a dubbed audio track through a TTS backend. |
 | `mux` | Builds the final video container from the source video, subtitles, and audio tracks. |
-| `run` | Runs the full pipeline end-to-end. |
 
 ## CLI layout
 
@@ -156,7 +153,7 @@ Each step:
 - creates its own output artifacts in the job directory;
 - does not keep pipeline state in memory between commands.
 
-This allows steps to be run independently, an individual step to be repeated, the backend/config to be changed, and `run` to remain only an orchestration layer.
+This allows steps to be run independently, an individual step to be repeated, and the backend/config to be changed, while an external orchestration script only chains the commands.
 
 ## Artifact names
 
@@ -201,7 +198,6 @@ Local steps:
 - `subtitles`
 - `accent`
 - `mux`
-- `run` as an orchestration layer
 
 Local steps may use the filesystem, CPU, and local utilities such as `ffmpeg`, but they must not require a remote model backend. `accent` is a local step that may load a bundled local model (the Russian accentor runs on the CPU/GPU of the machine invoking the CLI); it has no configured service entry and makes no network calls.
 
