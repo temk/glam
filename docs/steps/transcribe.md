@@ -143,8 +143,13 @@ Two consecutive segments are merged when none of the **stop** conditions hold an
   `because`, `which`, `that`, `so`, `uh`, `um`, a comma, or a colon); or the next segment starts with
   a lowercase letter.
 
-A growing unit is force-closed — the next segment starts a fresh unit regardless of the rules above —
-once it would exceed **12 s**, **250 characters**, or **5 source segments**.
+A growing unit has size limits, applied so a unit is not cut in the middle of a sentence:
+
+- **soft target** (**12 s**, **250 characters**, or **5 source segments**) — once a unit reaches one
+  of these it is closed, but only when it already ends on a sentence boundary (`.`, `?`, `!`). While
+  it ends mid-sentence the unit keeps merging toward the next boundary.
+- **absolute ceiling** (**20 s**, **400 characters**, or **8 source segments**) — a hard stop that
+  closes the unit even mid-sentence, so a run without any sentence boundary cannot grow without bound.
 
 Each resulting unit gets a new sequential `id` (renumbered from `0`) and records `source_ids`, the
 list of raw segment ids it absorbed, for debugging.

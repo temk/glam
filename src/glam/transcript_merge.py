@@ -15,10 +15,16 @@ HARD_STOP_CHARS = ("?", "!")
 MERGE_MAX_PAUSE = 0.8
 NO_MERGE_PAUSE = 1.2
 
-# Force a unit closed once it grows past any of these, even mid-sentence.
-MAX_UNIT_DURATION = 12.0
-MAX_UNIT_CHARS = 250
-MAX_UNIT_SEGMENTS = 5
+# Soft target: once a unit reaches one of these it is closed — but only at a clean sentence boundary
+# (it ends on `.?!`). Mid-sentence the unit keeps growing toward the next boundary.
+SOFT_MAX_DURATION = 12.0
+SOFT_MAX_CHARS = 250
+SOFT_MAX_SEGMENTS = 5
+
+# Absolute ceiling: stop growing even mid-sentence, so a boundary-less run cannot grow without bound.
+HARD_MAX_DURATION = 20.0
+HARD_MAX_CHARS = 400
+HARD_MAX_SEGMENTS = 8
 
 
 @dataclass
@@ -63,12 +69,12 @@ def _should_merge(unit: _Unit, segment: AsrSegment) -> bool:
     # Hard vetoes: a long gap or a finished question/exclamation ends the sentence.
     if pause > NO_MERGE_PAUSE or prev.endswith(HARD_STOP_CHARS):
         return False
-    # Size caps: force the unit closed once it grows too large, even mid-sentence.
-    if segment.end - unit.start > MAX_UNIT_DURATION:
+    # Absolute ceiling: stop even mid-sentence so a boundary-less run stays bounded.
+    if _merge_exceeds(unit, segment, HARD_MAX_DURATION, HARD_MAX_CHARS, HARD_MAX_SEGMENTS):
         return False
-    if len(unit.text) + len(segment.text) > MAX_UNIT_CHARS:
-        return False
-    if len(unit.source_ids) >= MAX_UNIT_SEGMENTS:
+    # Soft target: a large unit is closed only at a clean sentence boundary; otherwise it keeps
+    # merging toward the next boundary (bounded by the absolute ceiling above).
+    if prev.endswith(SENTENCE_END_CHARS) and _unit_reached(unit, SOFT_MAX_DURATION, SOFT_MAX_CHARS, SOFT_MAX_SEGMENTS):
         return False
     # Positive triggers: any one means the sentence is still running.
     if pause < MERGE_MAX_PAUSE and not prev.endswith(SENTENCE_END_CHARS):
@@ -76,6 +82,18 @@ def _should_merge(unit: _Unit, segment: AsrSegment) -> bool:
     if _ends_with_continuation(prev):
         return True
     return bool(nxt) and nxt[0].islower()
+
+
+def _unit_reached(unit: _Unit, max_duration: float, max_chars: int, max_segments: int) -> bool:
+    return unit.end - unit.start >= max_duration or len(unit.text) >= max_chars or len(unit.source_ids) >= max_segments
+
+
+def _merge_exceeds(unit: _Unit, segment: AsrSegment, max_duration: float, max_chars: int, max_segments: int) -> bool:
+    return (
+        segment.end - unit.start > max_duration
+        or len(unit.text) + len(segment.text) > max_chars
+        or len(unit.source_ids) >= max_segments
+    )
 
 
 def _ends_with_continuation(prev: str) -> bool:

@@ -1,4 +1,4 @@
-from glam.transcript_merge import merge_sentences
+from glam.transcript_merge import SOFT_MAX_DURATION, merge_sentences
 from glam.backend.transcribe.base import AsrSegment
 
 
@@ -62,28 +62,45 @@ def test_question_mark_blocks_merge():
     assert [s.source_ids for s in out] == [[0], [1]]
 
 
-def test_force_closes_unit_after_max_segments():
-    # Six lowercase fragments all want to merge; the 5-source cap forces a new unit at the sixth.
-    words = ["the", " cat", " sat", " on", " the", " mat"]
-    segs = [_seg(i, i * 0.2, i * 0.2 + 0.1, w) for i, w in enumerate(words)]
+def test_soft_cap_extends_to_the_next_sentence_boundary():
+    # The unit passes the 12s soft cap mid-sentence, keeps going to the period, then closes there.
+    segs = [
+        _seg(0, 0.0, 6.0, " I was saying"),
+        _seg(1, 6.0, 11.0, " a lot of"),
+        _seg(2, 11.0, 14.0, " things."),  # period lands past the 12s soft cap
+        _seg(3, 14.0, 17.0, " Next point."),
+    ]
     out = merge_sentences(segs)
 
-    assert [s.source_ids for s in out] == [[0, 1, 2, 3, 4], [5]]
-    assert [s.id for s in out] == [0, 1]
+    assert [s.source_ids for s in out] == [[0, 1, 2], [3]]
+    assert out[0].end - out[0].start > SOFT_MAX_DURATION  # extended past the soft cap to the boundary
 
 
-def test_force_closes_unit_after_max_chars():
-    segs = [_seg(0, 0.0, 1.0, "a" * 200), _seg(1, 1.1, 2.0, " " + "b" * 100)]
+def test_soft_cap_does_not_cut_mid_sentence():
+    # Over the soft duration but never at a boundary and under the hard ceiling: stays one unit.
+    segs = [
+        _seg(0, 0.0, 7.0, " I keep talking and"),
+        _seg(1, 7.0, 13.0, " talking and"),  # now over 12s, but ends on "and"
+        _seg(2, 13.0, 15.0, " talking on"),
+    ]
     out = merge_sentences(segs)
 
-    assert [len(s.source_ids) for s in out] == [1, 1]
+    assert [s.source_ids for s in out] == [[0, 1, 2]]
+    assert out[0].end - out[0].start > SOFT_MAX_DURATION
 
 
-def test_force_closes_unit_after_max_duration():
-    segs = [_seg(0, 0.0, 1.0, "start and"), _seg(1, 1.1, 15.0, " end.")]
+def test_absolute_ceiling_cuts_a_boundaryless_run():
+    # No sentence boundary at all; the hard duration ceiling forces the cut mid-sentence.
+    segs = [
+        _seg(0, 0.0, 5.0, " going on and"),
+        _seg(1, 5.0, 10.0, " on and"),
+        _seg(2, 10.0, 16.0, " on and"),
+        _seg(3, 16.0, 23.0, " on forever"),  # would push the unit to 23s, over the 20s ceiling
+    ]
     out = merge_sentences(segs)
 
-    assert [s.source_ids for s in out] == [[0], [1]]
+    assert [s.source_ids for s in out] == [[0, 1, 2], [3]]
+    assert not out[0].text.rstrip().endswith((".", "?", "!"))  # cut mid-sentence by the ceiling
 
 
 def test_renumbers_and_records_source_ids():
