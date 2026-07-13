@@ -96,15 +96,16 @@ def init_cmd(video_file, source_lang, target_lang, glossary_path, voice, job_id,
 @job_id_option
 @config_option
 @click.option("--force", is_flag=True, help="Recompute even if the transcript already exists")
+@click.option("--strict", is_flag=True, help="Also remove filler interjections (uh, um, э, хмм, ...) while cleaning")
 @handle_glam_errors
-def transcribe_cmd(job_id, config_path, force):
+def transcribe_cmd(job_id, config_path, force, strict):
     """Transcribe a job's audio through the configured ASR service."""
     # Imported here, not at module top, so `--help` and local commands do not pull in
     # the OpenAI SDK. See docs/architecture.md "CLI layout".
     from glam.steps import transcribe as transcribe_step
 
     config = read_config(config_path)
-    transcribe_step.run(job_id, config, force=force, echo=click.echo)
+    transcribe_step.run(job_id, config, force=force, strict=strict, echo=click.echo)
 
 
 @main.command("translate")

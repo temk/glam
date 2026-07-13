@@ -33,7 +33,7 @@ class Transcript:
     segments: list[AsrSegment]
 
 
-def run(job_id: str, config: Config, force: bool = False, echo=print) -> Path:
+def run(job_id: str, config: Config, force: bool = False, strict: bool = False, echo=print) -> Path:
     """Transcribe a job's audio through the configured ASR service into `transcript.json`.
 
     Both artifacts are produced lazily: `transcript.raw.json` is regenerated (a fresh ASR call) only
@@ -62,7 +62,7 @@ def run(job_id: str, config: Config, force: bool = False, echo=print) -> Path:
         # transcript.json is healed in two passes: clean the raw segments, then merge the survivors into
         # sentence-level units (each keeps its source ids). Serialize the raw's top-level fields, then swap
         # in the merged segments, whose `source_ids` field the raw AsrSegment schema does not carry.
-        result = clean_segments(raw.segments)
+        result = clean_segments(raw.segments, strict=strict)
         merged = merge_sentences(result.segments)
         document = asdict(raw)
         document["segments"] = [asdict(segment) for segment in merged]

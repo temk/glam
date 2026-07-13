@@ -19,8 +19,11 @@ The step runs local pipeline code, but the ASR model is called through a remote 
 ## CLI
 
 ```bash
-uv run glam transcribe --job-id JOB_ID [--config PATH] [--force]
+uv run glam transcribe --job-id JOB_ID [--config PATH] [--strict] [--force]
 ```
+
+- `--strict` — also remove filler interjections while cleaning (see "Cleaning (healing) the
+  transcript"). Off by default.
 
 The CLI is defined in `src/glam/cli.py`.
 
@@ -97,18 +100,26 @@ The cleaning rules are applied in order:
 
 1. **Drop punctuation-only segments** — text with no letters or digits (for example `"."`, `"..."`, `"?!"`)
    is removed.
-2. **Check `end > start`** — detection only: a segment whose `end` is not after its `start` is kept but a
+2. **Remove filler interjections** (only with `--strict`) — hesitation sounds carrying no meaning
+   (English `uh`, `um`, `er`, `hmm`, `mm`, ...; Russian `э`, `эм`, `ммм`, `хм`, `хмм`, `а-а`, ...) are
+   removed. Matching ignores case and surrounding punctuation, so `"э.."` and `"Хммм"` match. Fillers
+   are removed both ways: a segment that is **only** fillers is dropped, and fillers **embedded** in a
+   longer segment are cut from its text (`"Так, э, давайте начнём"` → `"Так, давайте начнём"`) while its
+   timestamps are left unchanged. Without `--strict` this rule does nothing.
+3. **Check `end > start`** — detection only: a segment whose `end` is not after its `start` is kept but a
    warning is recorded.
-3. **Impossible speech rate** — detection only: when `len(text) / (end - start)` exceeds **25 chars/sec**
+4. **Impossible speech rate** — detection only: when `len(text) / (end - start)` exceeds **25 chars/sec**
    (only computed when `end > start`) the segment is kept but a warning is recorded.
-4. **Collapse consecutive identical segments** — neighbouring segments with equal text are merged into the
+5. **Collapse consecutive identical segments** — neighbouring segments with equal text are merged into the
    first, whose `end` is extended to cover the duplicates.
-5. **Collapse repeat-then-continuation** — when a segment's text repeats the previous segment's full text as a
+6. **Collapse repeat-then-continuation** — when a segment's text repeats the previous segment's full text as a
    whole-word prefix and adds more (a common Whisper tail artifact), the shorter earlier segment is dropped and
    the survivor's `start` is pulled back to cover it.
-6. **Renumber IDs** — surviving segments are renumbered sequentially from `0`.
+7. **Renumber IDs** — surviving segments are renumbered sequentially from `0`.
 
-Every removal or collapse also records a warning, so nothing is dropped silently.
+Every removal or collapse also records a warning, so nothing is dropped silently. The filler rule
+records `filler_only` when it drops a whole segment and `filler_removed` when it strips fillers from
+within one.
 
 ### `transcript.cleanup.json`
 

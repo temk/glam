@@ -84,6 +84,58 @@ def test_renumbers_ids_sequentially():
     assert [s.id for s in result.segments] == [0, 1]
 
 
+def test_fillers_are_kept_without_strict():
+    segments = [_seg(0, 0.0, 1.0, "э.."), _seg(1, 1.0, 3.0, "Так, э, давайте начнём.")]
+    result = clean_segments(segments)
+
+    assert [s.text for s in result.segments] == ["э..", "Так, э, давайте начнём."]
+    assert _rules(result) == []
+
+
+def test_strict_drops_filler_only_segment():
+    segments = [_seg(0, 0.0, 1.0, "Hello."), _seg(1, 1.0, 1.3, "э.."), _seg(2, 1.3, 2.0, "World.")]
+    result = clean_segments(segments, strict=True)
+
+    assert [s.text for s in result.segments] == ["Hello.", "World."]
+    warning = next(w for w in result.warnings if w.rule == "filler_only")
+    assert warning.segment_id == 1
+    assert warning.text == "э.."
+
+
+def test_strict_drops_english_and_hummed_fillers():
+    segments = [_seg(0, 0.0, 1.0, "Uh"), _seg(1, 1.0, 2.0, "Hmm,"), _seg(2, 2.0, 3.0, "Okay.")]
+    result = clean_segments(segments, strict=True)
+
+    assert [s.text for s in result.segments] == ["Okay."]
+    assert _rules(result) == ["filler_only", "filler_only"]
+
+
+def test_strict_strips_embedded_fillers_and_keeps_timestamps():
+    segments = [_seg(0, 0.0, 3.0, "Так, э, давайте начнём.")]
+    result = clean_segments(segments, strict=True)
+
+    assert [s.text for s in result.segments] == ["Так, давайте начнём."]
+    assert result.segments[0].start == 0.0 and result.segments[0].end == 3.0
+    assert _rules(result) == ["filler_removed"]
+
+
+def test_strict_preserves_leading_space_when_stripping_fillers():
+    # Whisper fragments start with a space; the merge step relies on it, so it must survive.
+    segments = [_seg(0, 0.0, 3.0, " um, we should start")]
+    result = clean_segments(segments, strict=True)
+
+    assert result.segments[0].text == " we should start"
+
+
+def test_strict_keeps_real_words_that_contain_a_filler():
+    # "Ummm" is a filler, but "summer"/"этаж" are real words that merely contain those letters.
+    segments = [_seg(0, 0.0, 2.0, "It was summer."), _seg(1, 2.0, 4.0, "Верхний этаж.")]
+    result = clean_segments(segments, strict=True)
+
+    assert [s.text for s in result.segments] == ["It was summer.", "Верхний этаж."]
+    assert _rules(result) == []
+
+
 def test_combined_pipeline_and_warning_ids_reference_raw_ids():
     segments = [
         _seg(0, 0.0, 1.0, "Intro"),

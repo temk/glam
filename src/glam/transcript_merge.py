@@ -26,6 +26,11 @@ HARD_MAX_DURATION = 20.0
 HARD_MAX_CHARS = 400
 HARD_MAX_SEGMENTS = 8
 
+# A finished unit shorter than BOTH of these is a stray interjection ("Oh.") that yields a 1-2 char
+# translation the TTS backend chokes on; absorb it into a neighbour instead of leaving it standalone.
+ABSORB_MAX_DURATION = 0.8
+ABSORB_MAX_CHARS = 12
+
 
 @dataclass
 class MergedSegment:
@@ -58,7 +63,41 @@ def merge_sentences(segments: list[AsrSegment]) -> list[MergedSegment]:
             unit.source_ids.append(segment.id)
         else:
             units.append(_Unit(segment.start, segment.end, segment.text, [segment.id]))
+    units = _absorb_tiny(units)
     return [MergedSegment(index, u.start, u.end, u.text, u.source_ids) for index, u in enumerate(units)]
+
+
+def _absorb_tiny(units: list[_Unit]) -> list[_Unit]:
+    """Fold every too-short standalone unit into a neighbour (the previous one, or the next one for a
+    leading unit), so no stray interjection survives as its own segment."""
+    if len(units) <= 1:
+        return units
+    result: list[_Unit] = []
+    for unit in units:
+        if result and _is_tiny(unit):
+            _append_into(result[-1], unit)
+        else:
+            result.append(unit)
+    if len(result) > 1 and _is_tiny(result[0]):
+        _prepend_into(result[1], result[0])
+        result.pop(0)
+    return result
+
+
+def _is_tiny(unit: _Unit) -> bool:
+    return (unit.end - unit.start) < ABSORB_MAX_DURATION and len(unit.text.strip()) < ABSORB_MAX_CHARS
+
+
+def _append_into(unit: _Unit, tail: _Unit) -> None:
+    unit.text += tail.text
+    unit.end = tail.end
+    unit.source_ids.extend(tail.source_ids)
+
+
+def _prepend_into(unit: _Unit, head: _Unit) -> None:
+    unit.text = head.text + unit.text
+    unit.start = head.start
+    unit.source_ids = head.source_ids + unit.source_ids
 
 
 def _should_merge(unit: _Unit, segment: AsrSegment) -> bool:

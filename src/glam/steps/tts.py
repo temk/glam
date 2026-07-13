@@ -8,7 +8,7 @@ from glam.common.job import JOB_MANIFEST_NAME, read_job_manifest
 from glam.common.hooks import service_hooks
 from glam.common.config import Config, ServiceName, ServiceConfig
 from glam.common.errors import GlamError
-from glam.backend.tts.base import build_tts_backend
+from glam.backend.tts.base import TtsBackendError, build_tts_backend
 from glam.common.translation import (
     TranslatedSegment,
     translation_filename,
@@ -24,6 +24,11 @@ TTS_VOICE_NAME_TEMPLATE = "tts.{}.{}.wav"
 # Each synthesized segment is cached here as its own WAV so a crash (or `--start`) can resume without
 # re-synthesizing everything. Files are keyed by target[.voice] so several languages/voices coexist.
 TTS_CACHE_DIRNAME = "tts"
+
+# A segment this short (stripped translated text) is a degenerate input — a stray interjection like
+# "О." — that some TTS servers reject. If synthesizing one fails, it becomes silence instead of
+# aborting the run. Longer text that fails is a real error and still propagates.
+SHORT_TEXT_SILENCE_LIMIT = 5
 
 
 class TtsError(GlamError):
@@ -106,10 +111,16 @@ def _synthesize(
     cache_dir.mkdir(parents=True, exist_ok=True)
     backend = None  # built lazily, so a pure resume from cache needs no backend at all
     total = len(segments)
-    fragments = []
+    # `None` marks a silent segment; it is filled in once the audio format is known from a real one.
+    fragments: list[_Fragment | None] = []
     for index, segment in enumerate(segments, start=1):
         cache_path = cache_dir / f"{cache_key}.{segment.id:04d}.wav"
         stamp = f"[{datetime.now():%H:%M:%S}]"
+        text = (segment.translated_text or "").strip()
+        if not text:
+            echo(f"{stamp} segment {index}/{total} (id {segment.id}): silent (empty text)")
+            fragments.append(None)
+            continue
         if start is not None and index < start:
             # `--start` says these earlier segments are already done; take them from the cache.
             if not cache_path.exists():
@@ -117,19 +128,38 @@ def _synthesize(
                     f"--start {start}: segment {index} (id {segment.id}) is not cached at {cache_path}; "
                     "use a lower --start or run without it"
                 )
-            echo(f"{stamp} segment {index}/{total}: before --start, using cache")
+            echo(f"{stamp} segment {index}/{total} (id {segment.id}): before --start, using cache")
             audio = cache_path.read_bytes()
         elif cache_path.exists() and not force:
-            echo(f"{stamp} segment {index}/{total}: using cache")
+            echo(f"{stamp} segment {index}/{total} (id {segment.id}): using cache")
             audio = cache_path.read_bytes()
         else:
-            echo(f"{stamp} synthesizing segment {index}/{total}")
+            echo(f"{stamp} synthesizing segment {index}/{total} (id {segment.id})")
             if backend is None:
                 backend = build_tts_backend(service)
-            audio = backend.synthesize(segment.translated_text, target=target, voice=voice)
+            try:
+                audio = backend.synthesize(segment.translated_text, target=target, voice=voice)
+            except TtsBackendError:
+                # A short degenerate input the server can't handle becomes silence; a failure on real
+                # text is a genuine error and still aborts the run.
+                if len(text) > SHORT_TEXT_SILENCE_LIMIT:
+                    raise
+                echo(f"{stamp} segment {index}/{total} (id {segment.id}): synthesis failed on {text!r}; using silence")
+                fragments.append(None)
+                continue
             _cache_segment(cache_path, audio, segment)
         fragments.append(_read_wav(audio, segment))
-    return fragments
+    return _fill_silence(fragments)
+
+
+def _fill_silence(fragments: list[_Fragment | None]) -> list[_Fragment]:
+    """Replace silent-segment placeholders with a zero-length fragment matching the audio format of a
+    real one; `_assemble` then pads the timeline with silence up to the next segment's start."""
+    ref = next((f for f in fragments if f is not None), None)
+    if ref is None:
+        raise TtsError("no segment had synthesizable text")
+    silent = _Fragment(ref.nchannels, ref.sampwidth, ref.framerate, b"")
+    return [f if f is not None else silent for f in fragments]
 
 
 def _cache_segment(cache_path: Path, audio: bytes, segment: TranslatedSegment) -> None:

@@ -109,3 +109,33 @@ def test_renumbers_and_records_source_ids():
 
     assert [s.id for s in out] == [0, 1, 2]
     assert [s.source_ids for s in out] == [[3], [7], [9]]
+
+
+def test_absorbs_tiny_interjection_into_previous():
+    # " Oh." (0.32s, 3 chars) can't merge by the normal rules (preceded by "?", followed by uppercase),
+    # so it is absorbed into the previous unit rather than left as a stray segment.
+    segs = [
+        _seg(0, 0.0, 2.0, " Was there a question?"),
+        _seg(1, 2.0, 2.32, " Oh."),
+        _seg(2, 2.5, 5.0, " Yeah, so next."),
+    ]
+    out = merge_sentences(segs)
+
+    assert [s.source_ids for s in out] == [[0, 1], [2]]
+    assert out[0].text.strip().endswith("Oh.")
+
+
+def test_absorbs_tiny_leading_unit_into_next():
+    segs = [_seg(0, 0.0, 0.3, " Oh."), _seg(1, 0.5, 3.0, " Yeah, so this is the thing.")]
+    out = merge_sentences(segs)
+
+    assert [s.source_ids for s in out] == [[0, 1]]
+    assert out[0].text.strip().startswith("Oh.")
+
+
+def test_does_not_absorb_short_text_with_long_duration():
+    # 3 chars but 1.5s (drawn out): absorbing needs BOTH a short duration and short text.
+    segs = [_seg(0, 0.0, 3.0, " Something happened here."), _seg(1, 3.0, 4.5, " Oh.")]
+    out = merge_sentences(segs)
+
+    assert [s.source_ids for s in out] == [[0], [1]]

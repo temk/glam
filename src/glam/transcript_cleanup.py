@@ -6,6 +6,46 @@ from glam.backend.transcribe.base import AsrSegment
 # speech (~25 chars/sec is roughly twice a fast English speaker). Warn-only; the segment is kept.
 MAX_CHARS_PER_SECOND = 25.0
 
+# Hesitation/filler interjections ("uh", "um", "э", "хмм", ...) that carry no meaning to translate,
+# subtitle, or dub. Removed only under `strict` (see docs/steps/transcribe.md). Confined to
+# hesitation sounds, not real words, so cutting them from inside a sentence stays safe.
+FILLER_WORDS = frozenset(
+    {
+        # Russian
+        "э",
+        "ээ",
+        "эээ",
+        "э-э",
+        "эм",
+        "эмм",
+        "мм",
+        "ммм",
+        "хм",
+        "хмм",
+        "хммм",
+        "а-а",
+        "о-о",
+        "ой",
+        # English
+        "uh",
+        "uhh",
+        "um",
+        "umm",
+        "er",
+        "err",
+        "erm",
+        "hmm",
+        "hmmm",
+        "mm",
+        "mmm",
+        "mhm",
+    }
+)
+
+# Punctuation that clings to a filler token in ASR output ("э..", "um,"); stripped before matching.
+# A leading/trailing hyphen is stripped too, but an internal one is not, so "э-э" stays intact.
+_FILLER_STRIP = ".,!?…:;-—\"'«»() "
+
 
 @dataclass
 class CleanupWarning:
@@ -21,13 +61,20 @@ class CleanupResult:
     warnings: list[CleanupWarning]
 
 
-def clean_segments(segments: list[AsrSegment]) -> CleanupResult:
-    """Heal raw ASR segments and collect warnings; warnings reference the raw (pre-renumber) ids."""
+def clean_segments(segments: list[AsrSegment], strict: bool = False) -> CleanupResult:
+    """Heal raw ASR segments and collect warnings; warnings reference the raw (pre-renumber) ids.
+
+    With `strict`, filler interjections are also removed — both filler-only segments and fillers
+    embedded inside longer segments (see docs/steps/transcribe.md).
+    """
     warnings: list[CleanupWarning] = []
     segs = list(segments)
 
     segs, dropped = _drop_punctuation_only(segs)
     warnings.extend(dropped)
+    if strict:
+        segs, fillers = _strip_filler_words(segs)
+        warnings.extend(fillers)
     warnings.extend(_check_timing(segs))  # detection only
     warnings.extend(_check_speed(segs))  # detection only
     segs, merged = _collapse_duplicates(segs)
@@ -51,6 +98,33 @@ def _drop_punctuation_only(segments: list[AsrSegment]) -> tuple[list[AsrSegment]
             warnings.append(CleanupWarning("punctuation_only", seg.id, seg.text, "removed punctuation-only segment"))
         else:
             kept.append(seg)
+    return kept, warnings
+
+
+def _strip_fillers(text: str) -> str | None:
+    """Drop filler tokens from `text`; return the cleaned text, or None when only fillers remain.
+
+    A leading space (Whisper emits fragments like `" word"`) is preserved so the later merge step,
+    which concatenates fragment texts directly, keeps the word boundary."""
+    leading = " " if text[:1].isspace() else ""
+    kept = [tok for tok in text.split() if tok.strip(_FILLER_STRIP).lower() not in FILLER_WORDS]
+    if not any(ch.isalnum() for tok in kept for ch in tok):
+        return None
+    return leading + " ".join(kept)
+
+
+def _strip_filler_words(segments: list[AsrSegment]) -> tuple[list[AsrSegment], list[CleanupWarning]]:
+    kept: list[AsrSegment] = []
+    warnings: list[CleanupWarning] = []
+    for seg in segments:
+        cleaned = _strip_fillers(seg.text)
+        if cleaned is None:
+            warnings.append(CleanupWarning("filler_only", seg.id, seg.text, "removed filler-only segment"))
+            continue
+        if cleaned != seg.text:
+            warnings.append(CleanupWarning("filler_removed", seg.id, seg.text, f"stripped fillers -> {cleaned!r}"))
+            seg = replace(seg, text=cleaned)
+        kept.append(seg)
     return kept, warnings
 
 

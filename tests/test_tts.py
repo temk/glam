@@ -161,6 +161,39 @@ def test_uses_translated_text(tmp_path, patch_chatterbox):
     assert [c["json"]["text"] for c in calls] == ["Привет.", "Мир."]
 
 
+def test_short_text_synthesis_failure_becomes_silence(tmp_path, patch_chatterbox):
+    # The tiny "О." segment fails on the server (empty response); the run must not crash.
+    calls = patch_chatterbox(audio=lambda j: b"" if j["text"] == "О." else _wav_bytes(0.5))
+    translation = {
+        **TRANSLATION,
+        "segments": [
+            {"id": 0, "start": 0.0, "end": 1.5, "text": "Hello.", "translated_text": "Привет."},
+            {"id": 1, "start": 1.5, "end": 3.0, "text": "Oh.", "translated_text": "О."},
+        ],
+    }
+    _make_job(tmp_path, translation=translation)
+    path = tts_step.run("jobA", _chatterbox_config(tmp_path), echo=lambda *_: None)
+
+    assert [c["json"]["text"] for c in calls] == ["Привет.", "О."]  # both were attempted
+    assert path.exists()
+    # A failed segment is not cached, so a later run retries it.
+    assert not (tmp_path / "jobA" / "tts" / "ru.0001.wav").exists()
+
+
+def test_synthesis_failure_on_long_text_raises(tmp_path, patch_chatterbox):
+    # A failure on real (non-degenerate) text is a genuine error and aborts the run.
+    patch_chatterbox(audio=lambda j: b"")
+    translation = {
+        **TRANSLATION,
+        "segments": [
+            {"id": 0, "start": 0.0, "end": 1.5, "text": "Hello there.", "translated_text": "Привет всем."},
+        ],
+    }
+    _make_job(tmp_path, translation=translation)
+    with pytest.raises(TtsBackendError):
+        tts_step.run("jobA", _chatterbox_config(tmp_path), echo=lambda *_: None)
+
+
 def test_prefers_fixed_translation_when_present(tmp_path, patch_chatterbox):
     calls = patch_chatterbox()
     job_path = _make_job(tmp_path)  # writes translation.ru.json
