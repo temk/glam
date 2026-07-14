@@ -28,7 +28,7 @@ Expected command shape:
 uv run glam init <video_file> [--source SOURCE_LANG] [--target TARGET_LANG] [--glossary PATH] [--voice VOICE] [--job-id JOB_ID] [--config PATH] [--force]
 ```
 
-`--source` and `--target` are required only when the config has no `defaults.source`/`defaults.target` to fall back on.
+`--source` and `--target` are required only when the config has no `defaults.source`/`defaults.target` to fall back on. `--glossary` is optional and falls back to `defaults.glossary`.
 
 ## Inputs
 
@@ -37,7 +37,7 @@ uv run glam init <video_file> [--source SOURCE_LANG] [--target TARGET_LANG] [--g
 - `video_file` — path to a local video file;
 - `--source` — source/original language code, for example `en`; optional when the config's `defaults.source` is set (the flag overrides the default);
 - `--target` — target language code, for example `ru`; optional when the config's `defaults.target` is set (the flag overrides the default);
-- `--glossary` — optional path to a JSON glossary file to copy into the job directory;
+- `--glossary` — optional path to a JSON glossary file to copy into the job directory; when omitted, `init` falls back to the config's `defaults.glossary`;
 - `--voice` — optional default TTS voice for this job, stored in `job.yaml` and used later by `tts`;
 - `config file` — path to the config file, defaulting to `~/.glam.yaml`;
 - `job-id` — optional explicit job id;
@@ -106,7 +106,7 @@ If `--glossary PATH` is provided, `init` normalizes the input into that map base
 
 A malformed input (invalid JSON in a `.json` file, a non-string entry, or a top-level JSON value that is neither object nor array) is an error reported through the base error class.
 
-If `--glossary` is not provided, `init` creates an empty glossary file:
+If `--glossary` is not provided and the config has no `defaults.glossary`, `init` creates an empty glossary file:
 
 ```json
 {}

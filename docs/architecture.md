@@ -275,6 +275,7 @@ job_dir: ./jobs
 defaults:
   source: en
   target: ru
+  glossary: ./conf/glossary.local.txt
 
 services:
   - name: transcribe
@@ -308,12 +309,13 @@ services:
 
 ### `defaults`
 
-`defaults` is an optional section holding job-level defaults. Currently it carries the default languages:
+`defaults` is an optional section holding job-level defaults:
 
 - `source` — default source language, used by `init` when `--source` is omitted;
-- `target` — default target language, used by `init` when `--target` is omitted.
+- `target` — default target language, used by `init` when `--target` is omitted;
+- `glossary` — default glossary path, used by `init` when `--glossary` is omitted.
 
-Both are optional. A per-run `--source`/`--target` flag always overrides the default, and if neither the flag nor the default is set, `init` reports a clear error. Job-level parameters (like the languages) are still recorded per job in `job.yaml`; `defaults` only seeds them at `init` time.
+All are optional. A per-run `--source`/`--target`/`--glossary` flag always overrides the default. If neither the flag nor the default sets a language, `init` reports a clear error; when neither sets a glossary, `init` writes an empty `glossary.json`. Job-level parameters are still recorded per job (languages in `job.yaml`, the glossary as the job-local `glossary.json`); `defaults` only seeds them at `init` time.
 
 ### `services`
 
@@ -346,4 +348,4 @@ Semantics:
 
 Step-specific tuning does not belong to the config file; it lives in CLI options, job-local files such as `job.yaml` and `glossary.json`, and constants of the corresponding step module.
 
-Source language, target language, and glossary path are not global config values. They are parameters of a specific job and are passed to `init` with `--source`, `--target`, and `--glossary`.
+Source language, target language, and glossary path are per-job parameters, passed to `init` with `--source`, `--target`, and `--glossary`. The optional `defaults` section only seeds them when the corresponding flag is omitted; it does not turn them into global pipeline settings — each job still records its own languages in `job.yaml` and its own `glossary.json`.

@@ -293,3 +293,43 @@ def test_cli_passes_job_id_and_glossary(tmp_path, fake_media):
     )
     assert result.exit_code == 0, result.output
     assert json.loads((jobs / "jid" / "glossary.json").read_text()) == {"pod": "pod", "node": "node"}
+
+
+def test_cli_uses_default_glossary(tmp_path, fake_media):
+    video = _make_video(tmp_path)
+    jobs = tmp_path / "jobs"
+    glossary = tmp_path / "default.txt"
+    glossary.write_text("loss\ninference\n")
+    config = tmp_path / "glam.yaml"
+    config.write_text(f"job_dir: {jobs}\ndefaults:\n  source: en\n  target: ru\n  glossary: {glossary}\n")
+
+    result = CliRunner().invoke(main, ["init", str(video), "--config", str(config)])
+    assert result.exit_code == 0, result.output
+    assert json.loads((jobs / "input" / "glossary.json").read_text()) == {"loss": "loss", "inference": "inference"}
+
+
+def test_cli_glossary_flag_overrides_default(tmp_path, fake_media):
+    video = _make_video(tmp_path)
+    jobs = tmp_path / "jobs"
+    default_glossary = tmp_path / "default.txt"
+    default_glossary.write_text("loss\n")
+    flag_glossary = tmp_path / "flag.txt"
+    flag_glossary.write_text("gradient\n")
+    config = tmp_path / "glam.yaml"
+    config.write_text(f"job_dir: {jobs}\ndefaults:\n  source: en\n  target: ru\n  glossary: {default_glossary}\n")
+
+    result = CliRunner().invoke(main, ["init", str(video), "--glossary", str(flag_glossary), "--config", str(config)])
+    assert result.exit_code == 0, result.output
+    assert json.loads((jobs / "input" / "glossary.json").read_text()) == {"gradient": "gradient"}
+
+
+def test_cli_errors_on_missing_default_glossary(tmp_path, fake_media):
+    video = _make_video(tmp_path)
+    jobs = tmp_path / "jobs"
+    config = tmp_path / "glam.yaml"
+    missing = tmp_path / "nope.txt"
+    config.write_text(f"job_dir: {jobs}\ndefaults:\n  source: en\n  target: ru\n  glossary: {missing}\n")
+
+    result = CliRunner().invoke(main, ["init", str(video), "--config", str(config)])
+    assert result.exit_code != 0
+    assert "glossary file not found" in result.output

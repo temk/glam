@@ -96,6 +96,8 @@ def _load_glossary_map(glossary_path: str | Path) -> dict[str, str]:
     identity map (`term -> term`). Any other file is read as text, one term per line.
     """
     path = Path(glossary_path)
+    if not path.is_file():
+        raise GlossaryError(f"glossary file not found: {path}")
     if path.suffix.lower() == ".json":
         try:
             data = json.loads(path.read_text())

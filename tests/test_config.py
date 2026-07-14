@@ -100,15 +100,17 @@ def test_missing_service_raises(tmp_path):
 
 
 def test_defaults_section_parsed(tmp_path):
-    config = read_config(_write(tmp_path, "defaults:\n  source: en\n  target: ru\nservices: []\n"))
+    config = read_config(_write(tmp_path, "defaults:\n  source: en\n  target: ru\n  glossary: ./g.txt\nservices: []\n"))
     assert config.defaults.source == "en"
     assert config.defaults.target == "ru"
+    assert config.defaults.glossary == "./g.txt"
 
 
 def test_defaults_absent_gives_empty(tmp_path):
     config = read_config(_write(tmp_path, "services: []\n"))
     assert config.defaults.source is None
     assert config.defaults.target is None
+    assert config.defaults.glossary is None
 
 
 @pytest.mark.parametrize(

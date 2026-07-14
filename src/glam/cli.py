@@ -58,7 +58,7 @@ def version_cmd():
     "glossary_path",
     default=None,
     type=click.Path(exists=True, dir_okay=False),
-    help="Path to a JSON glossary to copy into the job",
+    help="Path to a JSON glossary to copy into the job (default: defaults.glossary)",
 )
 @click.option("--voice", default=None, help="Default TTS voice for this job, stored in job.yaml")
 @click.option("--job-id", "job_id", default=None, help="Job id (default: derived from filename)")
@@ -74,6 +74,7 @@ def init_cmd(video_file, source_lang, target_lang, glossary_path, voice, job_id,
     config = read_config(config_path)
     source_lang = source_lang or config.defaults.source
     target_lang = target_lang or config.defaults.target
+    glossary_path = glossary_path or config.defaults.glossary
     if not source_lang or not target_lang:
         raise click.UsageError(
             "missing language: pass --source and --target, or set defaults.source/target in the config"

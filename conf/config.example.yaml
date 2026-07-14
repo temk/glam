@@ -1,9 +1,11 @@
 job_dir: ./jobs
 
-# Optional default languages; `init` uses these when --source/--target are omitted.
+# Optional job defaults; `init` uses these when the matching flag is omitted.
 defaults:
   source: en
   target: ru
+  # Default glossary path, used when --glossary is omitted. A per-run --glossary overrides it.
+  # glossary: ./conf/glossary.local.txt
 
 services:
   - name: transcribe
@@ -18,6 +20,16 @@ services:
     params:
       model: qwen2.5:7b
       api_key: MY_SECRET_KEY
+    # Optional side-effect HTTP calls around the step (e.g. load/unload the model on the GPU).
+    # `pre` runs before the step's work (only when it actually runs), `post` runs after in a
+    # `finally`. At least one of pre/post is required. `method` defaults to POST, `timeout` to 180s.
+    # hooks:
+    #   pre:
+    #     url: http://<inference-host>:9090/v1/actions/prepare-translate
+    #     timeout: 120
+    #   post:
+    #     url: http://<inference-host>:9090/v1/actions/release-translate
+    #     timeout: 60
 
   # Native Chatterbox-TTS-Server: `url` is the server root, the backend appends `/tts`.
   # The target language is sent per request; a built-in default voice is used unless --voice or the

@@ -64,6 +64,7 @@ class Defaults:
 
     source: str | None = None
     target: str | None = None
+    glossary: str | None = None
 
 
 @dataclass
