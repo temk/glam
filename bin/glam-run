@@ -25,7 +25,7 @@ echo
 echo Job $job started in ${dir}
 echo
 
-$glam init --job-id ${job} "$1"
+$glam init --job-id ${job} $(readlink -f "$1")
 $glam transcribe --strict --job-id ${job}
 $glam translate --job-id ${job}
 $glam accent --job-id ${job}
