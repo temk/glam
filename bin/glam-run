@@ -3,7 +3,7 @@
 #
 set -euo pipefail
 
-glam=$(dirname "$0")/glam-cli
+glam=$(dirname $(readlink -f "$0"))/glam-cli
 
 
 if [ "$1" == "" ]; 
