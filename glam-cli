@@ -1,5 +1,0 @@
-#!/usr/bin/bash 
-#
-#
-uv run glam $*
-

@@ -1,0 +1,41 @@
+#!/usr/bin/bash 
+#
+#
+set -euo pipefail
+
+glam=$(dirname "$0")/glam-cli
+
+
+if [ "$1" == "" ]; 
+then
+    echo usage: $0 '<input-video>'
+    exit 1
+fi
+
+if [ !  -f "$1" ]; 
+then
+    echo File $1 not found
+    exit 1
+fi
+
+job=$(uuidgen| cut -c1-8)
+dir=$(yq -r .job_dir ${HOME}/.glam.yaml)/${job}
+
+echo 
+echo Job $job started in ${dir}
+echo
+
+$glam init --job-id ${job} "$1"
+$glam transcribe --strict --job-id ${job}
+$glam translate --job-id ${job}
+$glam accent --job-id ${job}
+$glam subtitles --job-id ${job}
+$glam tts --job-id ${job}
+$glam mux --job-id ${job}
+
+echo 
+echo $job is Done. Result saved to $(readlink -f ${dir}/result.mp4)
+echo
+
+
+
