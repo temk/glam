@@ -1,4 +1,5 @@
 import json
+import wave
 import openai
 import pytest
 from types import SimpleNamespace
@@ -16,7 +17,13 @@ DEFAULT_SEGMENTS = [
 ]
 
 
-def _make_job(tmp_path: Path, job_id: str = "jobA", source: str = "en", with_audio: bool = True) -> Path:
+def _make_job(
+    tmp_path: Path,
+    job_id: str = "jobA",
+    source: str = "en",
+    with_audio: bool = True,
+    duration_seconds: float = 3.0,
+) -> Path:
     job_path = tmp_path / job_id
     job_path.mkdir(parents=True)
     manifest = JobManifest(
@@ -27,14 +34,23 @@ def _make_job(tmp_path: Path, job_id: str = "jobA", source: str = "en", with_aud
             filename="video.mp4",
             artifact="source.mp4",
             audio_artifact="audio.wav",
-            duration_seconds=3.0,
+            duration_seconds=duration_seconds,
         ),
         languages=Languages(source=source, target="ru"),
     )
     write_job_manifest(manifest, job_path / "job.yaml")
     if with_audio:
-        (job_path / "audio.wav").write_bytes(b"fake-wav")
+        _write_wav(job_path / "audio.wav", duration_seconds)
     return job_path
+
+
+def _write_wav(path: Path, duration_seconds: float, framerate: int = 8) -> None:
+    """Write silence of the given duration. The frame rate is unrealistically low to keep long clips small."""
+    with wave.open(str(path), "wb") as w:
+        w.setnchannels(1)
+        w.setsampwidth(2)
+        w.setframerate(framerate)
+        w.writeframes(b"\x00\x00" * int(duration_seconds * framerate))
 
 
 def _config(tmp_path: Path, with_service: bool = True, model: str = "whisper-x") -> Config:
@@ -135,6 +151,25 @@ def test_requests_verbose_segments_in_source_language(tmp_path, patch_client):
     assert req["language"] == "de"
     assert req["response_format"] == "verbose_json"
     assert req["timestamp_granularities"] == ["segment"]
+
+
+@pytest.mark.parametrize("duration_seconds, expected_timeout", [(3.0, 180), (120.0, 180), (1800.0, 1800)])
+def test_request_timeout_follows_audio_duration(tmp_path, patch_client, duration_seconds, expected_timeout):
+    calls = patch_client()
+    _make_job(tmp_path, duration_seconds=duration_seconds)
+
+    transcribe_step.run("jobA", _config(tmp_path), echo=lambda *_: None)
+
+    assert calls[0]["timeout"] == expected_timeout
+
+
+def test_unreadable_audio_raises(tmp_path, patch_client):
+    patch_client()
+    job_path = _make_job(tmp_path)
+    (job_path / "audio.wav").write_bytes(b"not-a-wav")
+
+    with pytest.raises(TranscribeBackendError):
+        transcribe_step.run("jobA", _config(tmp_path), echo=lambda *_: None)
 
 
 def test_skips_when_transcript_exists(tmp_path, patch_client):

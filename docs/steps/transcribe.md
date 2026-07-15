@@ -47,6 +47,8 @@ The step uses the service named `transcribe`. Its `protocol` selects the backend
 
 The step must request a response format with segment-level timestamps.
 
+The ASR request timeout is not configured. The backend measures the audio it is about to send and uses its duration as the timeout, with a floor of 3 minutes for short clips, since a local ASR backend runs at roughly realtime or faster. Audio whose duration cannot be read is an error.
+
 ## Output
 
 The step creates three artifacts:
@@ -198,7 +200,8 @@ Expected errors:
 - no `transcribe` service in the config;
 - ASR service is unavailable;
 - ASR response is invalid;
-- response does not contain segment-level timestamps.
+- response does not contain segment-level timestamps;
+- the audio's duration cannot be read.
 
 ## Tests
 
@@ -213,4 +216,5 @@ Tests should cover:
 - skipping when `transcript.json` already exists;
 - recreating with `--force`;
 - handling segment-level timestamps;
+- deriving the ASR request timeout from the audio's own duration, including the floor for short clips;
 - errors for missing input and invalid backend response.
