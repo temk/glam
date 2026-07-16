@@ -18,7 +18,13 @@ then
     exit 1
 fi
 
-job=$(uuidgen| cut -c1-8)
+if [ "$2" == "" ];
+then
+    job=$(uuidgen| cut -c1-8)
+else
+    job=$2
+fi
+
 dir=$(yq -r .job_dir ${HOME}/.glam.yaml)/${job}
 
 echo 
